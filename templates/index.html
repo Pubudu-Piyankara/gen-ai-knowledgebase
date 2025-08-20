@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG Knowledge Base</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        .upload-area {
+            border: 2px dashed #d1d5db;
+            border-radius: 8px;
+            transition: all 0.3s ease;
+        }
+        .upload-area:hover {
+            border-color: #3b82f6;
+            background-color: #f8fafc;
+        }
+        .upload-area.dragover {
+            border-color: #3b82f6;
+            background-color: #eff6ff;
+        }
+        .progress-bar {
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+        .chat-message {
+            max-width: 80%;
+        }
+        .user-message {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .bot-message {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <!-- Header -->
+    <header class="bg-white shadow-sm border-b">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center py-4">
+                <div class="flex items-center">
+                    <i class="fas fa-brain text-blue-600 text-2xl mr-3"></i>
+                    <h1 class="text-2xl font-bold text-gray-900">RAG Knowledge Base</h1>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <span id="status-indicator" class="flex items-center text-sm">
+                        <div class="w-2 h-2 bg-green-500 rounded-full mr-2"></div>
+                        Connected
+                    </span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            
+            <!-- Upload Section -->
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <h2 class="text-xl font-semibold text-gray-900 mb-6 flex items-center">
+                    <i class="fas fa-upload text-blue-600 mr-2"></i>
+                    Document Upload
+                </h2>
+                
+                <!-- Upload Area -->
+                <div id="upload-area" class="upload-area p-8 text-center mb-6">
+                    <i class="fas fa-cloud-upload-alt text-4xl text-gray-400 mb-4"></i>
+                    <p class="text-lg text-gray-600 mb-2">Drag and drop files here</p>
+                    <p class="text-sm text-gray-500 mb-4">or</p>
+                    <button id="file-select-btn" class="bg-blue-600 text-white px-6 py-2 rounded-md hover:bg-blue-700 transition-colors">
+                        Select Files
+                    </button>
+                    <input type="file" id="file-input" class="hidden" multiple accept=".pdf,.docx,.doc,.pptx,.ppt,.txt,.md,.html,.rtf">
+                    <p class="text-xs text-gray-500 mt-2">
+                        Supported formats: PDF, DOCX, DOC, PPTX, PPT, TXT, MD, HTML, RTF
+                    </p>
+                </div>
+
+                <!-- Progress Bar -->
+                <div id="progress-container" class="hidden mb-4">
+                    <div class="flex justify-between text-sm text-gray-600 mb-1">
+                        <span id="progress-text">Uploading...</span>
+                        <span id="progress-percent">0%</span>
+                    </div>
+                    <div class="w-full bg-gray-200 rounded-full h-2">
+                        <div id="progress-bar" class="progress-bar bg-blue-600 h-2 rounded-full"></div>
+                    </div>
+                </div>
+
+                <!-- Upload Status -->
+                <div id="upload-status" class="hidden"></div>
+
+                <!-- File List -->
+                <div id="file-list" class="space-y-2"></div>
+            </div>
+
+            <!-- Query Section -->
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <h2 class="text-xl font-semibold text-gray-900 mb-6 flex items-center">
+                    <i class="fas fa-search text-green-600 mr-2"></i>
+                    Query Documents
+                </h2>
+
+                <!-- Query Form -->
+                <div class="mb-6">
+                    <div class="flex space-x-2">
+                        <input 
+                            type="text" 
+                            id="query-input" 
+                            placeholder="Ask a question about your documents..."
+                            class="flex-1 px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                        >
+                        <button 
+                            id="query-btn" 
+                            class="bg-green-600 text-white px-6 py-2 rounded-md hover:bg-green-700 transition-colors flex items-center"
+                        >
+                            <i class="fas fa-search mr-2"></i>
+                            Search
+                        </button>
+                    </div>
+                    
+                    <!-- Advanced Options -->
+                    <div class="mt-4">
+                        <button id="advanced-toggle" class="text-sm text-blue-600 hover:text-blue-800 flex items-center">
+                            <i class="fas fa-cog mr-1"></i>
+                            Advanced Options
+                            <i class="fas fa-chevron-down ml-1"></i>
+                        </button>
+                        <div id="advanced-options" class="hidden mt-3 p-4 bg-gray-50 rounded-md">
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-1">Results Count</label>
+                                    <select id="top-k" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500">
+                                        <option value="3">3 results</option>
+                                        <option value="5" selected>5 results</option>
+                                        <option value="10">10 results</option>
+                                        <option value="20">20 results</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-1">Include Metadata</label>
+                                    <div class="flex items-center">
+                                        <input type="checkbox" id="include-metadata" checked class="mr-2">
+                                        <span class="text-sm text-gray-600">Show document details</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Query Results -->
+                <div id="query-results" class="space-y-4"></div>
+            </div>
+        </div>
+
+        <!-- Chat Section -->
+        <div class="mt-8 bg-white rounded-lg shadow-md">
+            <div class="p-6 border-b">
+                <h2 class="text-xl font-semibold text-gray-900 flex items-center">
+                    <i class="fas fa-comments text-purple-600 mr-2"></i>
+                    AI Chat Assistant
+                </h2>
+            </div>
+            
+            <div id="chat-container" class="h-96 overflow-y-auto p-6 space-y-4">
+                <div class="chat-message bot-message text-white p-4 rounded-lg">
+                    <div class="flex items-start">
+                        <i class="fas fa-robot mr-3 mt-1"></i>
+                        <div>
+                            <p>Hello! I'm your AI assistant. Upload some documents and I'll help you find information and answer questions about them.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="p-6 border-t bg-gray-50">
+                <div class="flex space-x-2">
+                    <input 
+                        type="text" 
+                        id="chat-input" 
+                        placeholder="Ask me anything about your documents..."
+                        class="flex-1 px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+                    >
+                    <button 
+                        id="chat-send-btn" 
+                        class="bg-purple-600 text-white px-6 py-2 rounded-md hover:bg-purple-700 transition-colors flex items-center"
+                    >
+                        <i class="fas fa-paper-plane mr-2"></i>
+                        Send
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Document Management -->
+        <div class="mt-8 bg-white rounded-lg shadow-md p-6">
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-xl font-semibold text-gray-900 flex items-center">
+                    <i class="fas fa-folder text-orange-600 mr-2"></i>
+                    Document Library
+                </h2>
+                <button id="refresh-docs-btn" class="bg-gray-600 text-white px-4 py-2 rounded-md hover:bg-gray-700 transition-colors flex items-center">
+                    <i class="fas fa-sync-alt mr-2"></i>
+                    Refresh
+                </button>
+            </div>
+            
+            <div id="document-list" class="space-y-3">
+                <div class="text-center text-gray-500 py-8">
+                    <i class="fas fa-file-alt text-4xl mb-4"></i>
+                    <p>No documents uploaded yet. Start by uploading some files above!</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div id="loading-overlay" class="hidden fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+        <div class="bg-white rounded-lg p-6 flex items-center space-x-4">
+            <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+            <span class="text-lg">Processing...</span>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
