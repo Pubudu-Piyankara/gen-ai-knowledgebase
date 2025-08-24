@@ -95,6 +95,57 @@ EXTRACT_IMAGES=true
 ```
 
 -----
+Create config.py file in the app.py root directory
+**Example `config.py` file with values:**
+
+```ini
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class Config:
+    # Flask/FastAPI settings
+    SECRET_KEY = os.environ.get('SECRET_KEY') or 'a-default-secret-key'
+    MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB max file size
+
+    # Milvus/Zilliz settings
+    MILVUS_HOST = os.environ.get('MILVUS_HOST', 'localhost')
+    MILVUS_PORT = os.environ.get('MILVUS_PORT', '19530')
+    MILVUS_URI = os.environ.get('MILVUS_URI')
+    MILVUS_TOKEN = os.environ.get('MILVUS_TOKEN')
+    COLLECTION_NAME = os.environ.get('COLLECTION_NAME', 'document_embeddings')
+    DIMENSION = 384
+
+    # Supabase settings
+    SUPABASE_URL = os.environ.get('SUPABASE_URL')
+    SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
+    SUPABASE_BUCKET_NAME = os.environ.get('SUPABASE_BUCKET_NAME', 'uploads')
+
+    # Storage settings
+    USE_SUPABASE_STORAGE = os.environ.get('USE_SUPABASE_STORAGE', 'False').lower() == 'true'
+    STORE_ORIGINAL_FILES = os.environ.get('STORE_ORIGINAL_FILES', 'True').lower() == 'true'
+    UPLOAD_FOLDER = 'uploads'
+    ALLOWED_EXTENSIONS = {'pdf', 'docx', 'doc', 'pptx', 'ppt', 'txt', 'md', 'html', 'rtf'}
+
+    # Text processing settings
+    CHUNK_SIZE = 1000
+    CHUNK_OVERLAP = 200
+
+    # AI/LLM settings
+    GEMINI_KEY = os.environ.get('GEMINI_KEY')
+    DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'gpt-3.5-turbo')
+
+    # Embedding model
+    EMBEDDING_MODEL = 'sentence-transformers/all-MiniLM-L6-v2'
+
+    # DocLing settings
+    ENABLE_OCR = os.environ.get('ENABLE_OCR', 'True').lower() == 'true'
+    EXTRACT_TABLES = os.environ.get('EXTRACT_TABLES', 'True').lower() == 'true'
+    EXTRACT_IMAGES = os.environ.get('EXTRACT_IMAGES', 'True').lower() == 'true'
+```
+
+-----
 
 ### 3\. Install Dependencies
 
