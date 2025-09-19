@@ -75,7 +75,7 @@ Context:
 
 Question: {query}
 
-Please provide a helpful answer based on the context above and explain simply about that with examples in 200 words:"""
+Please provide a helpful answer based on the context above :"""
 
             logger.info(f"Generating response with Gemini for query: {query}")
             response = self.gemini_model.generate_content(prompt)
