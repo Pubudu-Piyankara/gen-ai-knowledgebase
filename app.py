@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from httpcore import request
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Tuple
 import tempfile
@@ -20,13 +21,9 @@ from services.query_service import QueryService
 from services.storage_service import StorageManager
 from config import Config
 from supabase import create_client, Client
+from werkzeug.utils import secure_filename
+from fastapi import Request
 
-
-from flask import Flask
-from flask_cors import CORS
-
-app = Flask(__name__)
-CORS(app)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -134,146 +131,245 @@ async def health_check():
         }
     )
     
-@app.post("/api/process-memory")
-async def process_memory(
-    background_tasks: BackgroundTasks,
-    type: str = Form(...),
-    fileUrl: str = Form(...),
-    fileName: str = Form(...),
-    fileType: str = Form(...),
-    spaceId: str = Form(...),
-    storageMethod: str = Form(...),
-    memoryId: str = Form(...)
-):
-    """Process a file uploaded via Next.js into the RAG system."""
     
+def validate_file_parameters(type: str, storageMethod: str, fileName: str, fileUrl: str) -> None:
+    """Validate incoming file parameters."""
     if type != "upload":
         raise HTTPException(status_code=400, detail="Invalid type, must be 'upload'")
     
     if storageMethod not in ["storage", "database"]:
         raise HTTPException(status_code=400, detail="Invalid storage method")
     
-    supabase = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+    if not fileName:
+        raise HTTPException(status_code=400, detail="fileName is required")
     
+    if not fileUrl:
+        raise HTTPException(status_code=400, detail="fileUrl is required")
+
+async def save_uploaded_file(uploaded_file: UploadFile, original_filename: str) -> tuple[str, int]:
+    """Save uploaded file to temporary location."""
     try:
-        # Update status to "processing"
+        # Secure the filename
+        filename = secure_filename(original_filename)
+        
+        # Create temporary file with proper extension
+        temp_path = tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=Path(filename).suffix,
+            prefix="upload_"
+        ).name
+        
+        # Save the uploaded file (FastAPI way)
+        with open(temp_path, "wb") as buffer:
+            content = await uploaded_file.read()
+            buffer.write(content)
+        
+        # Get file size
+        file_size = os.path.getsize(temp_path)
+        
+        logger.info(f"File saved to temporary path: {temp_path}, Size: {file_size} bytes")
+        return temp_path, file_size
+        
+    except Exception as e:
+        logger.error(f"Failed to save uploaded file: {str(e)}")
+        raise ValueError(f"Failed to save uploaded file: {str(e)}")
+
+# Fix the validate_request_data function for FastAPI
+async def validate_request_data(form_data: dict, files: dict):
+    """Validate incoming request data."""
+    required_fields = ['type', 'fileName', 'fileType', 'spaceId', 'storageMethod', 'memoryId']
+    
+    for field in required_fields:
+        if field not in form_data or not form_data[field]:
+            raise ValueError(f"Missing required field: {field}")
+    
+    if 'file' not in files:
+        raise ValueError("No file uploaded")
+    
+    if form_data['type'] != "upload":
+        raise ValueError("Invalid type, must be 'upload'")
+    
+    if form_data['storageMethod'] not in ["storage", "database"]:
+        raise ValueError("Invalid storage method")
+    
+# Helper function to update memory status
+def update_memory_status(supabase, memory_id: str, status: str) -> bool:
+    """Update memory processing status in Supabase."""
+    try:
         update_response = supabase.table("memories").update({
-            "processing_status": "processing"
-        }).eq("id", memoryId).execute()
+            "processing_status": status
+        }).eq("id", memory_id).execute()
         
         if not update_response.data:
-            logger.warning(f"Failed to update status to processing for memory {memoryId}")
+            logger.warning(f"Failed to update status to '{status}' for memory {memory_id}")
+            return False
         
-        # Retrieve file based on storage method
-        temp_path = None
-        if storageMethod == "storage":
-            try:
-                # Extract file_path from public fileUrl
-                # fileUrl format: https://project.supabase.co/storage/v1/object/public/uploads/user_id/space_id/timestamp.ext
-                if "/uploads/" in fileUrl:
-                    file_path = fileUrl.split("/uploads/")[1]
-                else:
-                    raise HTTPException(status_code=400, detail="Invalid file URL format")
-                
-                # Download file from Supabase storage
-                file_bytes, _ = retrieve_file_from_supabase(
-                    config.SUPABASE_URL,
-                    config.SUPABASE_KEY,
-                    config.SUPABASE_BUCKET_NAME,  # Use config value
-                    file_path
-                )
-                
-                # Create temporary file
-                temp_path = tempfile.NamedTemporaryFile(delete=False, suffix=Path(fileName).suffix).name
-                with open(temp_path, 'wb') as f:
-                    f.write(file_bytes)
-                    
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Failed to retrieve file from storage: {str(e)}")
-                
-        elif storageMethod == "database":
-            try:
-                # fileUrl is base64 data URL
-                if fileUrl.startswith("data:"):
-                    file_bytes = base64.b64decode(fileUrl.split(',')[1])  # Remove data URL prefix
-                else:
-                    file_bytes = base64.b64decode(fileUrl)
-                
-                temp_path = tempfile.NamedTemporaryFile(delete=False, suffix=Path(fileName).suffix).name
-                with open(temp_path, 'wb') as f:
-                    f.write(file_bytes)
-                    
-            except (base64.binascii.Error, IndexError) as e:
-                raise HTTPException(status_code=400, detail=f"Invalid base64 data: {str(e)}")
-        
-        if not temp_path:
-            raise HTTPException(status_code=500, detail="Failed to retrieve file content")
-        
-        # Validate file size
-        file_size = os.path.getsize(temp_path)
-        if file_size > config.MAX_CONTENT_LENGTH:
+        logger.info(f"Successfully updated memory {memory_id} status to '{status}'")
+        return True
+    except Exception as e:
+        logger.error(f"Error updating memory {memory_id} status to '{status}': {str(e)}")
+        return False
+
+# Helper function to cleanup temporary file
+def cleanup_temp_file(temp_path: str) -> None:
+    """Safely cleanup temporary file."""
+    try:
+        if temp_path and os.path.exists(temp_path):
             os.unlink(temp_path)
-            raise HTTPException(status_code=413, detail="File too large")
+            logger.info(f"Cleaned up temporary file: {temp_path}")
+    except Exception as e:
+        logger.warning(f"Failed to cleanup temp file {temp_path}: {str(e)}")
+
+# Helper function to validate file
+def validate_file(temp_path: str, file_name: str) -> int:
+    """Validate file size and type."""
+    # Get file size
+    file_size = os.path.getsize(temp_path)
+    
+    # Validate file size (this is already handled by Flask's MAX_CONTENT_LENGTH, but double-check)
+    if file_size > config.MAX_CONTENT_LENGTH:
+        raise ValueError("File too large")
+    
+    # Validate file type
+    if hasattr(config, 'document_processor') and hasattr(config.document_processor, 'is_allowed_file'):
+        if not config.document_processor.is_allowed_file(file_name):
+            raise ValueError(f"File type not supported. Allowed types: {config.document_processor.allowed_extensions}")
+    
+    logger.info(f"File validation passed - Size: {file_size} bytes, Name: {file_name}")
+    return file_size
+    
+@app.post("/api/process-memory")
+async def process_memory(
+    file: UploadFile = File(...),
+    type: str = Form(...),
+    fileName: str = Form(...),
+    fileType: str = Form(...),
+    fileSize: str = Form(...),
+    spaceId: str = Form(...),
+    storageMethod: str = Form(...),
+    memoryId: str = Form(...)
+):
+    """
+    Process a file uploaded directly from Next.js into the RAG system.
+    """
+    
+    temp_path = None
+    supabase = None
+    
+    try:
+        # Log incoming request
+        logger.info(f"Received file upload request")
+        logger.info(f"File name: {fileName}")
+        logger.info(f"File type: {fileType}")
+        logger.info(f"Memory ID: {memoryId}")
         
-        # Validate file type
-        if not document_processor.is_allowed_file(fileName):
-            os.unlink(temp_path)
-            raise HTTPException(
-                status_code=400, 
-                detail=f"File type not supported. Allowed types: {document_processor.allowed_extensions}"
-            )
+        # Create form_data and files dict for validation
+        form_data = {
+            'type': type,
+            'fileName': fileName,
+            'fileType': fileType,
+            'spaceId': spaceId,
+            'storageMethod': storageMethod,
+            'memoryId': memoryId
+        }
+        files = {'file': file}
+        
+        # Validate request data
+        await validate_request_data(form_data, files)
+        
+        logger.info(f"Processing file: {fileName}")
+        logger.info(f"File type: {fileType}")
+        logger.info(f"Reported size: {fileSize}")
+        logger.info(f"Memory ID: {memoryId}")
+        logger.info(f"Storage method: {storageMethod}")
+        
+        # Initialize Supabase client
+        supabase = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+        
+        # Update status to "processing"
+        update_memory_status(supabase, memoryId, "processing")
+        
+        # Save uploaded file to temporary location
+        temp_path, actual_file_size = await save_uploaded_file(file, fileName)
+        
+        logger.info(f"File saved successfully. Actual size: {actual_file_size} bytes")
+        
+        # Validate file
+        validate_file(temp_path, fileName)
         
         # Process document
+        logger.info(f"Starting document processing for {fileName}")
+        
         processed_data = document_processor.process_document(temp_path)
         
         if not processed_data:
-            os.unlink(temp_path)
-            raise HTTPException(status_code=500, detail="Failed to process document")
+            raise ValueError("Failed to process document")
         
-        # Enhance metadata
-        metadata = processed_data['metadata']
-        metadata['space_id'] = spaceId
-        metadata['memory_id'] = memoryId
-        metadata['file_type'] = fileType
-        metadata['original_name'] = Path(fileName).name
-        metadata['storage_method'] = storageMethod
+        logger.info(f"Document processed successfully - Chunks created: {len(processed_data['content'])}")
+        
+        # Enhance metadata with additional information
+        metadata = processed_data.get('metadata', {})
+        metadata.update({
+            'space_id': spaceId,
+            'memory_id': memoryId,
+            'file_type': fileType,
+            'original_name': Path(fileName).name,
+            'storage_method': storageMethod,
+            'file_size': actual_file_size,
+            'chunks_count': len(processed_data['content']),
+            'processed_via': 'direct_upload'
+        })
         
         # Store in vector store
+        logger.info(f"Storing document in vector store: {fileName}")
         document_id = vector_store.store_document(
             filename=fileName,
             chunks=processed_data['content'],
             metadata=metadata
         )
         
-        # Clean up
-        os.unlink(temp_path)
+        logger.info(f"Document stored successfully - Document ID: {document_id}")
         
         # Update Supabase status to "completed"
-        update_response = supabase.table("memories").update({
-            "processing_status": "completed"
-        }).eq("id", memoryId).execute()
+        update_memory_status(supabase, memoryId, "completed")
         
-        if not update_response.data:
-            logger.error(f"Failed to update status to completed for memory {memoryId}")
-        
-        return JSONResponse({
+        # Prepare success response
+        response_data = {
             "message": "File processed and added to RAG system successfully",
             "document_id": document_id,
             "space_id": spaceId,
             "memory_id": memoryId,
-            "chunks_created": len(processed_data['content'])
-        })
+            "chunks_created": len(processed_data['content']),
+            "file_size": actual_file_size,
+            "storage_method": storageMethod,
+            "processing_method": "direct_upload"
+        }
+        
+        logger.info(f"Processing completed successfully for memory {memoryId}")
+        return JSONResponse(content=response_data, status_code=200)
+        
+    except ValueError as ve:
+        # Handle validation and processing errors
+        logger.error(f"Validation/Processing error: {str(ve)}")
+        cleanup_temp_file(temp_path)
+        if memoryId and supabase:
+            update_memory_status(supabase, memoryId, "failed")
+        return JSONResponse(content={"error": str(ve)}, status_code=400)
         
     except Exception as e:
-        logger.error(f"Error processing memory {memoryId}: {str(e)}")
-        try:
-            supabase.table("memories").update({
-                "processing_status": "failed"
-            }).eq("id", memoryId).execute()
-        except:
-            pass  # Don't fail if status update fails
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
-
+        # Handle unexpected errors
+        logger.error(f"Unexpected error processing memory: {str(e)}", exc_info=True)
+        cleanup_temp_file(temp_path)
+        if memoryId and supabase:
+            update_memory_status(supabase, memoryId, "failed")
+        
+        return JSONResponse(content={"error": f"Processing failed: {str(e)}"}, status_code=500)
+    
+    finally:
+        # Always cleanup temporary file
+        cleanup_temp_file(temp_path)
+        
+               
 @app.post("/api/upload")
 async def upload_document(
     background_tasks: BackgroundTasks,
