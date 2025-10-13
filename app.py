@@ -15,6 +15,8 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+import requests
+
 from services.document_processor import DocumentProcessor
 from services.vector_store import ZillizVectorStore
 from services.query_service import QueryService
@@ -23,7 +25,12 @@ from config import Config
 from supabase import create_client, Client
 from werkzeug.utils import secure_filename
 from fastapi import Request
-
+from services.memory_retrieval import (
+    retrieve_file_content,
+    get_file_mime_type,
+    validate_file_size,
+    prepare_multipart_data
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -196,20 +203,42 @@ async def validate_request_data(form_data: dict, files: dict):
 def update_memory_status(supabase, memory_id: str, status: str) -> bool:
     """Update memory processing status in Supabase."""
     try:
-        update_response = supabase.table("memories").update({
-            "processing_status": status
-        }).eq("id", memory_id).execute()
-        
-        if not update_response.data:
-            logger.warning(f"Failed to update status to '{status}' for memory {memory_id}")
+        # Validate inputs
+        if not supabase:
+            logger.warning(f"Supabase client is None, cannot update memory {memory_id}")
+            return False
+            
+        if not memory_id:
+            logger.warning("Memory ID is empty, cannot update status")
             return False
         
-        logger.info(f"Successfully updated memory {memory_id} status to '{status}'")
-        return True
+        # Log the update attempt
+        logger.info(f"Attempting to update memory {memory_id} status to '{status}'")
+        
+        # Perform the update with error handling
+        update_response = supabase.table("memories").update({
+            "processing_status": status,
+            "updated_at": datetime.now().isoformat()
+        }).eq("id", memory_id).execute()
+        
+        # Check if update was successful - Supabase returns empty data for updates sometimes
+        if hasattr(update_response, 'data') and update_response.data is not None:
+            if len(update_response.data) > 0:
+                logger.info(f"Successfully updated memory {memory_id} status to '{status}' - Data: {update_response.data}")
+                return True
+            else:
+                # Empty data doesn't necessarily mean failure in Supabase
+                logger.info(f"Update completed for memory {memory_id} status to '{status}' (empty response is normal)")
+                return True
+        else:
+            logger.warning(f"Unexpected response format when updating memory {memory_id}")
+            return False
+        
     except Exception as e:
-        logger.error(f"Error updating memory {memory_id} status to '{status}': {str(e)}")
+        # Log the full error with traceback
+        logger.error(f"Error updating memory {memory_id} status to '{status}': {str(e)}", exc_info=True)
         return False
-
+    
 # Helper function to cleanup temporary file
 def cleanup_temp_file(temp_path: str) -> None:
     """Safely cleanup temporary file."""
@@ -370,6 +399,291 @@ async def process_memory(
         cleanup_temp_file(temp_path)
         
                
+@app.post("/api/ingest-upload")
+async def ingest_upload(
+    type: str = Form(...),
+    memoryId: str = Form(...),
+    fileUrl: str = Form(...),
+    storageMethod: str = Form(...),
+    spaceId: str = Form(...),
+    fileName: str = Form(...),
+    fileType: str = Form(...),
+    fileSize: str = Form(...)
+):
+    """
+    Ingest a file from Supabase storage or base64 data and forward to processing endpoint.
+    """
+    
+    supabase = None
+    temp_path = None
+    
+    try:
+        # Validate required fields
+        if not all([memoryId, fileUrl, storageMethod, spaceId, fileName]):
+            raise HTTPException(
+                status_code=400, 
+                detail="Missing required fields: memoryId, fileUrl, storageMethod, spaceId, fileName"
+            )
+        
+        # Validate storage method
+        if storageMethod not in ['storage', 'database']:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid storageMethod. Must be 'storage' or 'database'"
+            )
+        
+        logger.info(f"Starting file ingestion for memory {memoryId}")
+        logger.info(f"Storage method: {storageMethod}, File: {fileName}")
+        logger.info(f"File URL: {fileUrl}")
+        
+        correct_supabase_url = config.SUPABASE_URL
+        supabase_key = config.SUPABASE_KEY
+        bucket_name = config.SUPABASE_BUCKET_NAME or "uploads"
+        
+        logger.info(f"Using Supabase URL: {correct_supabase_url}")
+        
+        # Initialize Supabase client with correct URL
+        try:
+            supabase = create_client(correct_supabase_url, supabase_key)
+            logger.info("Supabase client initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize Supabase client: {str(e)}", exc_info=True)
+            logger.warning("Proceeding without database status updates")
+            supabase = None
+        
+        # Update memory status to 'processing'
+        if supabase:
+            status_updated = update_memory_status(supabase, memoryId, "processing")
+            if not status_updated:
+                logger.warning(f"Failed to update memory status, but continuing...")
+        
+        # Retrieve file content
+        file_content = None
+        try:
+            logger.info(f"Attempting to retrieve file from: {fileUrl}")
+            
+            # if storageMethod == 'storage':
+            #     # Extract bucket and path from URL
+            #     # URL format: https://PROJECT.supabase.co/storage/v1/object/public/BUCKET/PATH
+            #     url_parts = fileUrl.split('/storage/v1/object/public/')
+                
+            #     if len(url_parts) == 2:
+            #         # Parse bucket and file path
+            #         path_parts = url_parts[1].split('/', 1)
+            #         bucket_name = path_parts[0]
+            #         file_path = path_parts[1] if len(path_parts) > 1 else ''
+                    
+            #         logger.info(f"Parsed URL - Bucket: {bucket_name}, Path: {file_path}")
+                    
+            #         # Try multiple approaches to download the file
+            #         download_success = False
+                    
+            #         # Approach 1: Try Supabase API first
+            #         if supabase and not download_success:
+            #             try:
+            #                 logger.info("Attempting download via Supabase storage API...")
+            #                 file_content = supabase.storage.from_(bucket_name).download(file_path)
+            #                 if file_content and len(file_content) > 0:
+            #                     logger.info(f"✅ Successfully downloaded via Supabase API, size: {len(file_content)} bytes")
+            #                     download_success = True
+            #                 else:
+            #                     logger.warning("Supabase API returned empty content")
+            #             except Exception as api_error:
+            #                 logger.warning(f"Supabase API failed: {str(api_error)}")
+                    
+            #         # Approach 2: Try direct HTTP download from public URL
+            #         if not download_success:
+            #             try:
+            #                 logger.info("Attempting direct HTTP download from public URL...")
+            #                 import requests
+            #                 response = requests.get(fileUrl)
+            #                 response.raise_for_status()
+            #                 file_content = response.content
+            #                 if len(file_content) > 0:
+            #                     logger.info(f"✅ Successfully downloaded via HTTP, size: {len(file_content)} bytes")
+            #                     download_success = True
+            #                 else:
+            #                     logger.warning("HTTP download returned empty content")
+            #             except requests.exceptions.RequestException as http_error:
+            #                 logger.warning(f"HTTP download failed: {str(http_error)}")
+                    
+            #         # Approach 3: Try authenticated download
+            #         if not download_success and supabase:
+            #             try:
+            #                 logger.info("Attempting authenticated download...")
+            #                 headers = {
+            #                     'Authorization': f'Bearer {supabase_key}',
+            #                     'apikey': supabase_key
+            #                 }
+            #                 response = requests.get(fileUrl, headers=headers, timeout=30)
+            #                 response.raise_for_status()
+            #                 file_content = response.content
+            #                 if len(file_content) > 0:
+            #                     logger.info(f"✅ Successfully downloaded with auth, size: {len(file_content)} bytes")
+            #                     download_success = True
+            #             except Exception as auth_error:
+            #                 logger.warning(f"Authenticated download failed: {str(auth_error)}")
+                    
+            #         if not download_success:
+            #             raise ValueError(f"All download methods failed. File may not exist at: {fileUrl}")
+                    
+            #     else:
+            #         # Malformed URL, try direct download
+            #         logger.info("URL format unexpected, trying direct download...")
+            #         response = requests.get(fileUrl, timeout=30)
+            #         response.raise_for_status()
+            #         file_content = response.content
+            #         logger.info(f"Downloaded file, size: {len(file_content)} bytes")
+            if storageMethod == 'storage':
+                download_success = False
+                
+                # METHOD 1: Direct HTTP download (works with signed URLs and public URLs)
+                try:
+                    logger.info("Method 1: Attempting direct HTTP download...")
+                    response = requests.get(fileUrl, timeout=30)
+                    response.raise_for_status()
+                    file_content = response.content
+                    if len(file_content) > 0:
+                        logger.info(f"✅ Successfully downloaded via HTTP, size: {len(file_content)} bytes")
+                        download_success = True
+                except requests.exceptions.RequestException as http_error:
+                    logger.warning(f"HTTP download failed: {str(http_error)}")
+                    
+            else:
+                # Database storage method (base64)
+                file_content = retrieve_file_content(fileUrl, storageMethod)
+                logger.info(f"Retrieved file content from database, size: {len(file_content)} bytes")
+                
+        except Exception as e:
+            logger.error(f"Error retrieving file: {str(e)}", exc_info=True)
+            if supabase:
+                update_memory_status(supabase, memoryId, "failed")
+            
+            # Provide more specific error messages
+            if "not_found" in str(e) or "404" in str(e):
+                error_msg = f"File not found at the specified location. The file may have been deleted or the URL is incorrect. URL: {fileUrl}"
+            elif "403" in str(e) or "Forbidden" in str(e):
+                error_msg = f"Access denied. The file may be private or the authentication is incorrect."
+            else:
+                error_msg = f"Failed to download file: {str(e)}"
+            
+            raise HTTPException(
+                status_code=400,
+                detail=error_msg
+            )
+        
+        if not file_content or len(file_content) == 0:
+            if supabase:
+                update_memory_status(supabase, memoryId, "failed")
+            raise HTTPException(status_code=500, detail="File content is empty")
+        
+        # Validate file size
+        try:
+            validate_file_size(file_content, config.MAX_CONTENT_LENGTH)
+        except ValueError as e:
+            if supabase:
+                update_memory_status(supabase, memoryId, "failed")
+            raise HTTPException(status_code=413, detail=str(e))
+        
+        # Save to temporary file for processing
+        try:
+            import tempfile
+            temp_path = tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=Path(fileName).suffix,
+                prefix="ingest_"
+            ).name
+            
+            with open(temp_path, "wb") as f:
+                f.write(file_content)
+            
+            logger.info(f"Saved file to temporary path: {temp_path}")
+            
+        except Exception as e:
+            logger.error(f"Failed to save temporary file: {str(e)}")
+            if supabase:
+                update_memory_status(supabase, memoryId, "failed")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to save file: {str(e)}"
+            )
+        
+        # Process document directly
+        try:
+            logger.info(f"Starting document processing for {fileName}")
+            
+            processed_data = document_processor.process_document(temp_path)
+            
+            if not processed_data:
+                raise ValueError("Failed to process document")
+            
+            logger.info(f"Document processed successfully - Chunks created: {len(processed_data['content'])}")
+            
+            # Enhance metadata
+            metadata = processed_data.get('metadata', {})
+            metadata.update({
+                'space_id': spaceId,
+                'memory_id': memoryId,
+                'file_type': fileType,
+                'original_name': Path(fileName).name,
+                'storage_method': storageMethod,
+                'file_size': len(file_content),
+                'chunks_count': len(processed_data['content']),
+                'processed_via': 'ingestion',
+                'file_url': fileUrl
+            })
+            
+            # Store in vector store
+            logger.info(f"Storing document in vector store: {fileName}")
+            document_id = vector_store.store_document(
+                filename=fileName,
+                chunks=processed_data['content'],
+                metadata=metadata
+            )
+            
+            logger.info(f"Document stored successfully - Document ID: {document_id}")
+            
+            # Update memory status to 'completed'
+            if supabase:
+                update_memory_status(supabase, memoryId, "completed")
+            
+            return JSONResponse({
+                "message": "File ingested and processed successfully",
+                "memory_id": memoryId,
+                "document_id": document_id,
+                "chunks_created": len(processed_data['content']),
+                "file_size": len(file_content),
+                "storage_method": storageMethod,
+                "processing_method": "ingestion"
+            }, status_code=200)
+            
+        except Exception as e:
+            logger.error(f"Processing failed: {str(e)}", exc_info=True)
+            if supabase:
+                update_memory_status(supabase, memoryId, "failed")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Processing failed: {str(e)}"
+            )
+    
+    except HTTPException:
+        raise
+        
+    except Exception as e:
+        logger.error(f"Unexpected error in file ingestion: {str(e)}", exc_info=True)
+        
+        if supabase and memoryId:
+            update_memory_status(supabase, memoryId, "failed")
+        
+        raise HTTPException(
+            status_code=500,
+            detail=f"Ingestion failed: {str(e)}"
+        )
+    
+    finally:
+        cleanup_temp_file(temp_path)
+        
+                
 @app.post("/api/upload")
 async def upload_document(
     background_tasks: BackgroundTasks,
