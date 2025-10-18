@@ -16,7 +16,7 @@ class QueryService:
         if self.GEMINI_KEY:
             genai.configure(api_key=self.GEMINI_KEY)
             # Use the updated model name - gemini-1.5-flash is faster and more cost-effective
-            self.gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+            self.gemini_model = genai.GenerativeModel('gemini-2.0-flash-lite')
             logger.info("Gemini client initialized successfully with gemini-1.5-flash model")
         else:
             self.gemini_model = None
