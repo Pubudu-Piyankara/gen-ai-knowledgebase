@@ -573,8 +573,8 @@ def create_signed_url(
     """
     try:
         supabase: Client = create_client(supabase_url, supabase_key)
-        signed_url = supabase.storage.from_(bucket_name).create_signed_url(file_path, expires_in)
-        
+        response = supabase.storage.from_(bucket_name).create_signed_url(file_path, expires_in)
+        signed_url = response.get('signedURL') if isinstance(response, dict) else None
         logger.info(f"Created signed URL for {file_path}, expires in {expires_in} seconds")
         return signed_url
         
