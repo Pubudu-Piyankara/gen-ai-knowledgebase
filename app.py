@@ -445,7 +445,7 @@ async def ingest_upload(
         
         logger.info(f"Using Supabase URL: {correct_supabase_url}")
         
-                # Initialize Supabase client with correct URL and proper API key
+        # Initialize Supabase client with correct URL and proper API key
         try:
             # Use regular SUPABASE_KEY for database operations (not the S3 service key)
             database_key = config.SUPABASE_KEY 
