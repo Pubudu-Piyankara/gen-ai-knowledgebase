@@ -14,8 +14,9 @@ import logging
 
 from datetime import datetime
 from pathlib import Path
-
+import uvicorn
 import requests
+import time
 
 from services.document_processor import DocumentProcessor
 from services.vector_store import ZillizVectorStore
@@ -28,6 +29,7 @@ from fastapi import Request
 from services.memory_retrieval import (
     retrieve_file_content,
     get_file_mime_type,
+    retrieve_file_from_supabase_advanced,
     validate_file_size,
     prepare_multipart_data
 )
@@ -413,6 +415,7 @@ async def ingest_upload(
     """
     Ingest a file from Supabase storage or base64 data and forward to processing endpoint.
     """
+    start_time = datetime.now()
     
     supabase = None
     temp_path = None
@@ -442,10 +445,12 @@ async def ingest_upload(
         
         logger.info(f"Using Supabase URL: {correct_supabase_url}")
         
-        # Initialize Supabase client with correct URL
+                # Initialize Supabase client with correct URL and proper API key
         try:
-            supabase = create_client(correct_supabase_url, supabase_key)
-            logger.info("Supabase client initialized successfully")
+            # Use regular SUPABASE_KEY for database operations (not the S3 service key)
+            database_key = config.SUPABASE_KEY 
+            supabase = create_client(correct_supabase_url, database_key)
+            logger.info("Supabase client initialized successfully for database operations")
         except Exception as e:
             logger.error(f"Failed to initialize Supabase client: {str(e)}", exc_info=True)
             logger.warning("Proceeding without database status updates")
@@ -457,98 +462,38 @@ async def ingest_upload(
             if not status_updated:
                 logger.warning(f"Failed to update memory status, but continuing...")
         
-        # Retrieve file content
+        # Retrieve file content with S3 credentials (separate from database operations)
         file_content = None
         try:
             logger.info(f"Attempting to retrieve file from: {fileUrl}")
             
-            # if storageMethod == 'storage':
-            #     # Extract bucket and path from URL
-            #     # URL format: https://PROJECT.supabase.co/storage/v1/object/public/BUCKET/PATH
-            #     url_parts = fileUrl.split('/storage/v1/object/public/')
-                
-            #     if len(url_parts) == 2:
-            #         # Parse bucket and file path
-            #         path_parts = url_parts[1].split('/', 1)
-            #         bucket_name = path_parts[0]
-            #         file_path = path_parts[1] if len(path_parts) > 1 else ''
-                    
-            #         logger.info(f"Parsed URL - Bucket: {bucket_name}, Path: {file_path}")
-                    
-            #         # Try multiple approaches to download the file
-            #         download_success = False
-                    
-            #         # Approach 1: Try Supabase API first
-            #         if supabase and not download_success:
-            #             try:
-            #                 logger.info("Attempting download via Supabase storage API...")
-            #                 file_content = supabase.storage.from_(bucket_name).download(file_path)
-            #                 if file_content and len(file_content) > 0:
-            #                     logger.info(f"✅ Successfully downloaded via Supabase API, size: {len(file_content)} bytes")
-            #                     download_success = True
-            #                 else:
-            #                     logger.warning("Supabase API returned empty content")
-            #             except Exception as api_error:
-            #                 logger.warning(f"Supabase API failed: {str(api_error)}")
-                    
-            #         # Approach 2: Try direct HTTP download from public URL
-            #         if not download_success:
-            #             try:
-            #                 logger.info("Attempting direct HTTP download from public URL...")
-            #                 import requests
-            #                 response = requests.get(fileUrl)
-            #                 response.raise_for_status()
-            #                 file_content = response.content
-            #                 if len(file_content) > 0:
-            #                     logger.info(f"✅ Successfully downloaded via HTTP, size: {len(file_content)} bytes")
-            #                     download_success = True
-            #                 else:
-            #                     logger.warning("HTTP download returned empty content")
-            #             except requests.exceptions.RequestException as http_error:
-            #                 logger.warning(f"HTTP download failed: {str(http_error)}")
-                    
-            #         # Approach 3: Try authenticated download
-            #         if not download_success and supabase:
-            #             try:
-            #                 logger.info("Attempting authenticated download...")
-            #                 headers = {
-            #                     'Authorization': f'Bearer {supabase_key}',
-            #                     'apikey': supabase_key
-            #                 }
-            #                 response = requests.get(fileUrl, headers=headers, timeout=30)
-            #                 response.raise_for_status()
-            #                 file_content = response.content
-            #                 if len(file_content) > 0:
-            #                     logger.info(f"✅ Successfully downloaded with auth, size: {len(file_content)} bytes")
-            #                     download_success = True
-            #             except Exception as auth_error:
-            #                 logger.warning(f"Authenticated download failed: {str(auth_error)}")
-                    
-            #         if not download_success:
-            #             raise ValueError(f"All download methods failed. File may not exist at: {fileUrl}")
-                    
-            #     else:
-            #         # Malformed URL, try direct download
-            #         logger.info("URL format unexpected, trying direct download...")
-            #         response = requests.get(fileUrl, timeout=30)
-            #         response.raise_for_status()
-            #         file_content = response.content
-            #         logger.info(f"Downloaded file, size: {len(file_content)} bytes")
             if storageMethod == 'storage':
-                download_success = False
+                # Prepare S3 configuration for private storage (using S3 service keys)
+                s3_config = {
+                    'endpoint': config.SUPABASE_BUCKET_URL_ENDPOINT,
+                    'region': config.SUPABASE_BUCKET_REGION,
+                    'access_key_id': config.SUPABASE_BUCKET_SERVICE_ACCESS_KEY_ID,
+                    'secret_access_key': config.SUPABASE_BUCKET_SERVICE_ACCESS_KEY,
+                    'bucket': bucket_name
+                }
                 
-                # METHOD 1: Direct HTTP download (works with signed URLs and public URLs)
-                try:
-                    logger.info("Method 1: Attempting direct HTTP download...")
-                    response = requests.get(fileUrl, timeout=30)
-                    response.raise_for_status()
-                    file_content = response.content
-                    if len(file_content) > 0:
-                        logger.info(f"✅ Successfully downloaded via HTTP, size: {len(file_content)} bytes")
-                        download_success = True
-                except requests.exceptions.RequestException as http_error:
-                    logger.warning(f"HTTP download failed: {str(http_error)}")
-                    
+                # Validate S3 configuration
+                if not all(s3_config.values()):
+                    missing_keys = [k for k, v in s3_config.items() if not v]
+                    raise ValueError(f"Missing S3 configuration: {missing_keys}")
+                
+                logger.info(f"Using S3 endpoint: {s3_config['endpoint']}")
+                logger.info(f"Using S3 region: {s3_config['region']}")
+                
+                # Use the advanced retrieval method with S3 config
+                file_content = retrieve_file_from_supabase_advanced(
+                    file_url=fileUrl,
+                    supabase_url=correct_supabase_url,
+                    supabase_key=database_key,  # Use database key for fallback methods
+                    bucket_name=bucket_name,
+                    s3_config=s3_config
+                )
+                logger.info(f"Retrieved file content, size: {len(file_content)} bytes")
             else:
                 # Database storage method (base64)
                 file_content = retrieve_file_content(fileUrl, storageMethod)
@@ -560,10 +505,12 @@ async def ingest_upload(
                 update_memory_status(supabase, memoryId, "failed")
             
             # Provide more specific error messages
-            if "not_found" in str(e) or "404" in str(e):
+            if "not_found" in str(e).lower() or "404" in str(e):
                 error_msg = f"File not found at the specified location. The file may have been deleted or the URL is incorrect. URL: {fileUrl}"
-            elif "403" in str(e) or "Forbidden" in str(e):
+            elif "403" in str(e) or "forbidden" in str(e).lower():
                 error_msg = f"Access denied. The file may be private or the authentication is incorrect."
+            elif "400" in str(e) or "bad request" in str(e).lower():
+                error_msg = f"Invalid file URL or request format. Please check the file URL."
             else:
                 error_msg = f"Failed to download file: {str(e)}"
             
@@ -646,6 +593,9 @@ async def ingest_upload(
             # Update memory status to 'completed'
             if supabase:
                 update_memory_status(supabase, memoryId, "completed")
+                
+            processing_time = (datetime.now() - start_time).total_seconds()
+            logger.info(f"✅ Total execution time: {processing_time:.2f} seconds")
             
             return JSONResponse({
                 "message": "File ingested and processed successfully",
@@ -1083,7 +1033,7 @@ async def get_memory_analytics(memory_id: str, user_id: str):
         raise HTTPException(status_code=500, detail=f"Analytics failed: {str(e)}")
 
 if __name__ == "__main__":
-    import uvicorn
+    
     uvicorn.run(
         "app:app",
         host="0.0.0.0",
