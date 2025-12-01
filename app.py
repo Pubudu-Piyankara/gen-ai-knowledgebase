@@ -1,12 +1,12 @@
-import base64
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Depends, BackgroundTasks, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from httpcore import request
+import httpx
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any
 import tempfile
 import os
 import shutil
@@ -15,36 +15,88 @@ import logging
 from datetime import datetime
 from pathlib import Path
 import uvicorn
-import requests
-import time
 
 from services.document_processor import DocumentProcessor
-from services.vector_store import ZillizVectorStore
+from services.file_service import async_download_file, async_save_temp_file, cleanup_temp_file, save_uploaded_file
+from services.memory_service import async_update_memory_status, update_memory_status
+from services.validation_service import validate_file, validate_request_data,validate_file_size
+from services.async_vector_store import ZillizVectorStoreNew
 from services.query_service import QueryService
 from services.storage_service import StorageManager
 from config import Config
 from supabase import create_client, Client
-from werkzeug.utils import secure_filename
 from fastapi import Request
-from services.memory_retrieval import (
-    retrieve_file_content,
-    get_file_mime_type,
-    retrieve_file_from_supabase_advanced,
-    validate_file_size,
-    prepare_multipart_data
-)
+
+from services.vector_store import ZillizVectorStore
+from workers.process_document_background import process_document_background
+from contextlib import asynccontextmanager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
+# Global HTTP client and vector store
+http_client: Optional[httpx.AsyncClient] = None
+vector_store: Optional[ZillizVectorStoreNew] = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Lifespan event handler for FastAPI application.
+    Manages startup and shutdown of global resources.
+    """
+    # Startup
+    global http_client, vector_store
+    
+    try:
+        logger.info("🚀 Starting application initialization...")
+        
+        # Initialize HTTP client
+        http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=100)
+        )
+        logger.info("✅ HTTP client initialized")
+        
+        # Initialize vector store connection
+        try:
+            config = Config()
+            vector_store = ZillizVectorStoreNew(config)
+            logger.info("✅ Vector store instance created (lazy initialization)")
+        except Exception as e:
+            logger.warning(f"⚠️ Vector store creation failed: {e}")
+            vector_store = None
+        
+        logger.info("✅ Application startup completed successfully")
+        
+        # Application is now running
+        yield
+        
+    except Exception as e:
+        logger.error(f"❌ Startup failed: {e}")
+        raise
+    
+    finally:
+        # Shutdown
+        logger.info("🔄 Starting application shutdown...")
+        
+        if http_client:
+            try:
+                await http_client.aclose()
+                logger.info("✅ HTTP client closed")
+            except Exception as e:
+                logger.error(f"❌ Error closing HTTP client: {e}")
+        
+        logger.info("✅ Application shutdown completed")
+
+# Initialize FastAPI app with lifespan
 app = FastAPI(
     title="Advanced RAG System API",
     description="A comprehensive RAG system with document processing, vectorization, and intelligent querying",
     version="1.0.0",
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    lifespan=lifespan
 )
 
 # Mount static files and templates
@@ -63,18 +115,26 @@ app.add_middleware(
 # Initialize services
 config = Config()
 document_processor = DocumentProcessor()
-vector_store = ZillizVectorStore(
+query_service = QueryService(vector_store=None, GEMINI_KEY=config.GEMINI_KEY)
+storage_manager = StorageManager(config)
+vector_store_old = ZillizVectorStore(
     host=config.MILVUS_HOST,
     port=config.MILVUS_PORT,
     uri=config.MILVUS_URI,
     token=config.MILVUS_TOKEN,
     collection_name=config.COLLECTION_NAME
 )
-query_service = QueryService(vector_store, GEMINI_KEY=config.GEMINI_KEY)
-storage_manager = StorageManager(config)
 
 # Pydantic models
 class QueryRequest(BaseModel):
+    query: str = Field(..., description="Search query")
+    space_id: str = Field(..., description="Space ID to search within")
+    top_k: int = Field(default=5, ge=1, le=20, description="Number of results to return")
+    # score_threshold: float = Field(default=0.7, ge=0.0, le=1.0, description="Minimum similarity score")
+    filter_expr: Optional[str] = Field(default=None, description="Milvus filter expression")
+    include_metadata: bool = Field(default=True, description="Include metadata in results")
+    
+class QueryRequestOld(BaseModel):
     query: str = Field(..., description="Search query")
     top_k: int = Field(default=5, ge=1, le=20, description="Number of results to return")
     filter_expr: Optional[str] = Field(default=None, description="Milvus filter expression")
@@ -119,8 +179,25 @@ class HealthResponse(BaseModel):
     version: str
     services: Dict[str, str]
 
-# API Endpoints
+# Helper function to ensure vector store is available
+async def get_vector_store() -> ZillizVectorStoreNew:
+    """Get the vector store instance, ensuring it's initialized."""
+    global vector_store
+    
+    if vector_store is None:
+        logger.error("Vector store not initialized during startup")
+        raise HTTPException(status_code=503, detail="Vector store service not available - initialization failed")
+    
+    # Ensure the vector store is initialized (lazy initialization)
+    try:
+        await vector_store._ensure_initialized()
+        return vector_store
+    except Exception as e:
+        logger.error(f"Failed to initialize vector store: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Vector store initialization failed: {str(e)}")
 
+        
+# API Endpoints
 @app.get("/", response_class=HTMLResponse)
 async def read_root(request: Request):
     """Serve the main web interface"""
@@ -139,136 +216,7 @@ async def health_check():
             "storage": "active"
         }
     )
-    
-    
-def validate_file_parameters(type: str, storageMethod: str, fileName: str, fileUrl: str) -> None:
-    """Validate incoming file parameters."""
-    if type != "upload":
-        raise HTTPException(status_code=400, detail="Invalid type, must be 'upload'")
-    
-    if storageMethod not in ["storage", "database"]:
-        raise HTTPException(status_code=400, detail="Invalid storage method")
-    
-    if not fileName:
-        raise HTTPException(status_code=400, detail="fileName is required")
-    
-    if not fileUrl:
-        raise HTTPException(status_code=400, detail="fileUrl is required")
-
-async def save_uploaded_file(uploaded_file: UploadFile, original_filename: str) -> tuple[str, int]:
-    """Save uploaded file to temporary location."""
-    try:
-        # Secure the filename
-        filename = secure_filename(original_filename)
-        
-        # Create temporary file with proper extension
-        temp_path = tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=Path(filename).suffix,
-            prefix="upload_"
-        ).name
-        
-        # Save the uploaded file (FastAPI way)
-        with open(temp_path, "wb") as buffer:
-            content = await uploaded_file.read()
-            buffer.write(content)
-        
-        # Get file size
-        file_size = os.path.getsize(temp_path)
-        
-        logger.info(f"File saved to temporary path: {temp_path}, Size: {file_size} bytes")
-        return temp_path, file_size
-        
-    except Exception as e:
-        logger.error(f"Failed to save uploaded file: {str(e)}")
-        raise ValueError(f"Failed to save uploaded file: {str(e)}")
-
-# Fix the validate_request_data function for FastAPI
-async def validate_request_data(form_data: dict, files: dict):
-    """Validate incoming request data."""
-    required_fields = ['type', 'fileName', 'fileType', 'spaceId', 'storageMethod', 'memoryId']
-    
-    for field in required_fields:
-        if field not in form_data or not form_data[field]:
-            raise ValueError(f"Missing required field: {field}")
-    
-    if 'file' not in files:
-        raise ValueError("No file uploaded")
-    
-    if form_data['type'] != "upload":
-        raise ValueError("Invalid type, must be 'upload'")
-    
-    if form_data['storageMethod'] not in ["storage", "database"]:
-        raise ValueError("Invalid storage method")
-    
-# Helper function to update memory status
-def update_memory_status(supabase, memory_id: str, status: str) -> bool:
-    """Update memory processing status in Supabase."""
-    try:
-        # Validate inputs
-        if not supabase:
-            logger.warning(f"Supabase client is None, cannot update memory {memory_id}")
-            return False
-            
-        if not memory_id:
-            logger.warning("Memory ID is empty, cannot update status")
-            return False
-        
-        # Log the update attempt
-        logger.info(f"Attempting to update memory {memory_id} status to '{status}'")
-        
-        # Perform the update with error handling
-        update_response = supabase.table("memories").update({
-            "processing_status": status,
-            "updated_at": datetime.now().isoformat()
-        }).eq("id", memory_id).execute()
-        
-        # Check if update was successful - Supabase returns empty data for updates sometimes
-        if hasattr(update_response, 'data') and update_response.data is not None:
-            if len(update_response.data) > 0:
-                logger.info(f"Successfully updated memory {memory_id} status to '{status}' - Data: {update_response.data}")
-                return True
-            else:
-                # Empty data doesn't necessarily mean failure in Supabase
-                logger.info(f"Update completed for memory {memory_id} status to '{status}' (empty response is normal)")
-                return True
-        else:
-            logger.warning(f"Unexpected response format when updating memory {memory_id}")
-            return False
-        
-    except Exception as e:
-        # Log the full error with traceback
-        logger.error(f"Error updating memory {memory_id} status to '{status}': {str(e)}", exc_info=True)
-        return False
-    
-# Helper function to cleanup temporary file
-def cleanup_temp_file(temp_path: str) -> None:
-    """Safely cleanup temporary file."""
-    try:
-        if temp_path and os.path.exists(temp_path):
-            os.unlink(temp_path)
-            logger.info(f"Cleaned up temporary file: {temp_path}")
-    except Exception as e:
-        logger.warning(f"Failed to cleanup temp file {temp_path}: {str(e)}")
-
-# Helper function to validate file
-def validate_file(temp_path: str, file_name: str) -> int:
-    """Validate file size and type."""
-    # Get file size
-    file_size = os.path.getsize(temp_path)
-    
-    # Validate file size (this is already handled by Flask's MAX_CONTENT_LENGTH, but double-check)
-    if file_size > config.MAX_CONTENT_LENGTH:
-        raise ValueError("File too large")
-    
-    # Validate file type
-    if hasattr(config, 'document_processor') and hasattr(config.document_processor, 'is_allowed_file'):
-        if not config.document_processor.is_allowed_file(file_name):
-            raise ValueError(f"File type not supported. Allowed types: {config.document_processor.allowed_extensions}")
-    
-    logger.info(f"File validation passed - Size: {file_size} bytes, Name: {file_name}")
-    return file_size
-    
+ 
 @app.post("/api/process-memory")
 async def process_memory(
     file: UploadFile = File(...),
@@ -403,6 +351,7 @@ async def process_memory(
                
 @app.post("/api/ingest-upload")
 async def ingest_upload(
+    background_tasks: BackgroundTasks,
     type: str = Form(...),
     memoryId: str = Form(...),
     fileUrl: str = Form(...),
@@ -421,7 +370,7 @@ async def ingest_upload(
     temp_path = None
     
     try:
-        # Validate required fields
+        # Step 1: Validate required fields
         if not all([memoryId, fileUrl, storageMethod, spaceId, fileName]):
             raise HTTPException(
                 status_code=400, 
@@ -435,203 +384,75 @@ async def ingest_upload(
                 detail="Invalid storageMethod. Must be 'storage' or 'database'"
             )
         
-        logger.info(f"Starting file ingestion for memory {memoryId}")
-        logger.info(f"Storage method: {storageMethod}, File: {fileName}")
-        logger.info(f"File URL: {fileUrl}")
+        logger.info(f"🚀 Starting async ingestion for memory {memoryId}")
+        logger.info(f"File: {fileName}, Storage: {storageMethod}")
         
-        correct_supabase_url = config.SUPABASE_URL
-        supabase_key = config.SUPABASE_KEY
+        # Step 2: Update status to queued
+        await async_update_memory_status(memoryId, "queued")
+        
+        # Step 3: Download file asynchronously
+        logger.info(f"📥 Downloading file from: {fileUrl}")
+        
         bucket_name = config.SUPABASE_BUCKET_NAME or "uploads"
-        
-        logger.info(f"Using Supabase URL: {correct_supabase_url}")
-        
-        # Initialize Supabase client with correct URL and proper API key
-        try:
-            # Use regular SUPABASE_KEY for database operations (not the S3 service key)
-            database_key = config.SUPABASE_KEY 
-            supabase = create_client(correct_supabase_url, database_key)
-            logger.info("Supabase client initialized successfully for database operations")
-        except Exception as e:
-            logger.error(f"Failed to initialize Supabase client: {str(e)}", exc_info=True)
-            logger.warning("Proceeding without database status updates")
-            supabase = None
-        
-        # Update memory status to 'processing'
-        if supabase:
-            status_updated = update_memory_status(supabase, memoryId, "processing")
-            if not status_updated:
-                logger.warning(f"Failed to update memory status, but continuing...")
-        
-        # Retrieve file content with S3 credentials (separate from database operations)
-        file_content = None
-        try:
-            logger.info(f"Attempting to retrieve file from: {fileUrl}")
-            
-            if storageMethod == 'storage':
-                # Prepare S3 configuration for private storage (using S3 service keys)
-                s3_config = {
-                    'endpoint': config.SUPABASE_BUCKET_URL_ENDPOINT,
-                    'region': config.SUPABASE_BUCKET_REGION,
-                    'access_key_id': config.SUPABASE_BUCKET_SERVICE_ACCESS_KEY_ID,
-                    'secret_access_key': config.SUPABASE_BUCKET_SERVICE_ACCESS_KEY,
-                    'bucket': bucket_name
-                }
-                
-                # Validate S3 configuration
-                if not all(s3_config.values()):
-                    missing_keys = [k for k, v in s3_config.items() if not v]
-                    raise ValueError(f"Missing S3 configuration: {missing_keys}")
-                
-                logger.info(f"Using S3 endpoint: {s3_config['endpoint']}")
-                logger.info(f"Using S3 region: {s3_config['region']}")
-                
-                # Use the advanced retrieval method with S3 config
-                file_content = retrieve_file_from_supabase_advanced(
-                    file_url=fileUrl,
-                    supabase_url=correct_supabase_url,
-                    supabase_key=database_key,  # Use database key for fallback methods
-                    bucket_name=bucket_name,
-                    s3_config=s3_config
-                )
-                logger.info(f"Retrieved file content, size: {len(file_content)} bytes")
-            else:
-                # Database storage method (base64)
-                file_content = retrieve_file_content(fileUrl, storageMethod)
-                logger.info(f"Retrieved file content from database, size: {len(file_content)} bytes")
-                
-        except Exception as e:
-            logger.error(f"Error retrieving file: {str(e)}", exc_info=True)
-            if supabase:
-                update_memory_status(supabase, memoryId, "failed")
-            
-            # Provide more specific error messages
-            if "not_found" in str(e).lower() or "404" in str(e):
-                error_msg = f"File not found at the specified location. The file may have been deleted or the URL is incorrect. URL: {fileUrl}"
-            elif "403" in str(e) or "forbidden" in str(e).lower():
-                error_msg = f"Access denied. The file may be private or the authentication is incorrect."
-            elif "400" in str(e) or "bad request" in str(e).lower():
-                error_msg = f"Invalid file URL or request format. Please check the file URL."
-            else:
-                error_msg = f"Failed to download file: {str(e)}"
-            
-            raise HTTPException(
-                status_code=400,
-                detail=error_msg
-            )
+        file_content = await async_download_file(fileUrl, storageMethod, bucket_name)
         
         if not file_content or len(file_content) == 0:
-            if supabase:
-                update_memory_status(supabase, memoryId, "failed")
-            raise HTTPException(status_code=500, detail="File content is empty")
+            await async_update_memory_status(memoryId, "failed")
+            raise HTTPException(status_code=400, detail="File content is empty")
         
-        # Validate file size
+        # Step 4: Validate file size
         try:
             validate_file_size(file_content, config.MAX_CONTENT_LENGTH)
         except ValueError as e:
-            if supabase:
-                update_memory_status(supabase, memoryId, "failed")
+            await async_update_memory_status(memoryId, "failed")
             raise HTTPException(status_code=413, detail=str(e))
         
-        # Save to temporary file for processing
-        try:
-            import tempfile
-            temp_path = tempfile.NamedTemporaryFile(
-                delete=False,
-                suffix=Path(fileName).suffix,
-                prefix="ingest_"
-            ).name
-            
-            with open(temp_path, "wb") as f:
-                f.write(file_content)
-            
-            logger.info(f"Saved file to temporary path: {temp_path}")
-            
-        except Exception as e:
-            logger.error(f"Failed to save temporary file: {str(e)}")
-            if supabase:
-                update_memory_status(supabase, memoryId, "failed")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to save file: {str(e)}"
-            )
+        # Step 5: Save to temporary file asynchronously
+        temp_path = await async_save_temp_file(file_content, fileName)
         
-        # Process document directly
-        try:
-            logger.info(f"Starting document processing for {fileName}")
-            
-            processed_data = document_processor.process_document(temp_path)
-            
-            if not processed_data:
-                raise ValueError("Failed to process document")
-            
-            logger.info(f"Document processed successfully - Chunks created: {len(processed_data['content'])}")
-            
-            # Enhance metadata
-            metadata = processed_data.get('metadata', {})
-            metadata.update({
-                'space_id': spaceId,
-                'memory_id': memoryId,
-                'file_type': fileType,
-                'original_name': Path(fileName).name,
-                'storage_method': storageMethod,
-                'file_size': len(file_content),
-                'chunks_count': len(processed_data['content']),
-                'processed_via': 'ingestion',
-                'file_url': fileUrl
-            })
-            
-            # Store in vector store
-            logger.info(f"Storing document in vector store: {fileName}")
-            document_id = vector_store.store_document(
-                filename=fileName,
-                chunks=processed_data['content'],
-                metadata=metadata
-            )
-            
-            logger.info(f"Document stored successfully - Document ID: {document_id}")
-            
-            # Update memory status to 'completed'
-            if supabase:
-                update_memory_status(supabase, memoryId, "completed")
-                
-            processing_time = (datetime.now() - start_time).total_seconds()
-            logger.info(f"✅ Total execution time: {processing_time:.2f} seconds")
-            
-            return JSONResponse({
-                "message": "File ingested and processed successfully",
-                "memory_id": memoryId,
-                "document_id": document_id,
-                "chunks_created": len(processed_data['content']),
-                "file_size": len(file_content),
-                "storage_method": storageMethod,
-                "processing_method": "ingestion"
-            }, status_code=200)
-            
-        except Exception as e:
-            logger.error(f"Processing failed: {str(e)}", exc_info=True)
-            if supabase:
-                update_memory_status(supabase, memoryId, "failed")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Processing failed: {str(e)}"
-            )
-    
+        # Step 6: Queue background processing task
+        logger.info(f"📋 Queueing background processing for memory {memoryId}")
+        
+        background_tasks.add_task(
+            process_document_background,
+            temp_path=temp_path,
+            memory_id=memoryId,
+            space_id=spaceId,
+            file_name=fileName,
+            file_type=fileType,
+            file_size=len(file_content),
+            storage_method=storageMethod,
+            file_url=fileUrl
+        )
+        
+        processing_time = (datetime.now() - start_time).total_seconds()
+        logger.info(f"⚡ Async ingestion setup completed in {processing_time:.2f}s")
+        
+        # Step 7: Return immediate response
+        return JSONResponse({
+            "message": "File download completed, processing queued",
+            "memory_id": memoryId,
+            "status": "queued",
+            "file_size": len(file_content),
+            "storage_method": storageMethod,
+            "processing_method": "async_ingestion",
+            "estimated_processing_time": "30-60 seconds"
+        }, status_code=202)  # 202 Accepted
+        
     except HTTPException:
+        # Re-raise HTTP exceptions as-is
         raise
         
     except Exception as e:
-        logger.error(f"Unexpected error in file ingestion: {str(e)}", exc_info=True)
+        logger.error(f"❌ Unexpected error in async ingestion: {str(e)}", exc_info=True)
         
-        if supabase and memoryId:
-            update_memory_status(supabase, memoryId, "failed")
+        if memoryId:
+            await async_update_memory_status(memoryId, "failed")
         
         raise HTTPException(
             status_code=500,
-            detail=f"Ingestion failed: {str(e)}"
+            detail=f"Async ingestion failed: {str(e)}"
         )
-    
-    finally:
-        cleanup_temp_file(temp_path)
         
                 
 @app.post("/api/upload")
@@ -701,15 +522,207 @@ async def upload_document(
             os.unlink(tmp_path)
         raise HTTPException(status_code=500, detail="Internal server error")
 
+@app.get("/api/debug/vector-store")
+async def debug_vector_store():
+    """Debug endpoint to check vector store status and data"""
+    global vector_store
+    
+    try:
+        vector_store_instance = await get_vector_store()
+        
+        # Get collection stats
+        def _get_collection_stats():
+            try:
+                # Get basic collection info
+                collection_info = {
+                    "collection_name": vector_store_instance.collection_name,
+                    "collection_exists": vector_store_instance.collection is not None
+                }
+                
+                if vector_store_instance.collection:
+                    # Get entity count
+                    collection_info["entity_count"] = vector_store_instance.collection.num_entities
+                    
+                    # Try to get some sample data
+                    try:
+                        # Query a few random entities
+                        results = vector_store_instance.collection.query(
+                            expr="",
+                            limit=5,
+                            output_fields=["id", "space_id", "memory_id", "file_name", "content"]
+                        )
+                        
+                        collection_info["sample_entities"] = []
+                        for result in results:
+                            collection_info["sample_entities"].append({
+                                "id": result.get("id", ""),
+                                "space_id": result.get("space_id", ""),
+                                "memory_id": result.get("memory_id", ""),
+                                "file_name": result.get("file_name", ""),
+                                "content_preview": str(result.get("content", ""))[:100] + "..."
+                            })
+                    except Exception as e:
+                        collection_info["sample_entities_error"] = str(e)
+                
+                return collection_info
+                
+            except Exception as e:
+                return {"error": str(e)}
+        
+        from fastapi.concurrency import run_in_threadpool
+        stats = await run_in_threadpool(_get_collection_stats)
+        
+        status = {
+            "vector_store_exists": vector_store is not None,
+            "vector_store_type": type(vector_store).__name__ if vector_store else None,
+            "initialization_status": "success",
+            "collection_stats": stats
+        }
+        
+        return JSONResponse(status)
+        
+    except Exception as e:
+        return JSONResponse({
+            "vector_store_exists": vector_store is not None,
+            "error": str(e),
+            "initialization_status": "failed"
+        })
+
+@app.get("/api/debug/space/{space_id}")
+async def debug_space_data(space_id: str):
+    """Debug endpoint to check what data exists for a specific space"""
+    
+    try:
+        vector_store_instance = await get_vector_store()
+        
+        def _get_space_data():
+            try:
+                # Query all entities for this space
+                results = vector_store_instance.collection.query(
+                    expr=f'space_id == "{space_id}"',
+                    limit=100,
+                    output_fields=["id", "space_id", "memory_id", "file_name", "content", "chunk_index"]
+                )
+                
+                space_data = {
+                    "space_id": space_id,
+                    "total_chunks": len(results),
+                    "entities": []
+                }
+                
+                for result in results:
+                    space_data["entities"].append({
+                        "id": result.get("id", ""),
+                        "memory_id": result.get("memory_id", ""),
+                        "file_name": result.get("file_name", ""),
+                        "chunk_index": result.get("chunk_index", ""),
+                        "content_preview": str(result.get("content", ""))[:200] + "..."
+                    })
+                
+                return space_data
+                
+            except Exception as e:
+                return {"error": str(e), "space_id": space_id}
+        
+        from fastapi.concurrency import run_in_threadpool
+        data = await run_in_threadpool(_get_space_data)
+        
+        return JSONResponse(data)
+        
+    except Exception as e:
+        return JSONResponse({
+            "error": str(e),
+            "space_id": space_id
+        })
+
 @app.post("/api/query", response_model=QueryResponse)
 async def query_documents(request: QueryRequest):
-    """Query the indexed documents"""
+    """Query the indexed documents using async vector store - optimized for speed"""
+    
+    start_time = datetime.now()
+    
+    try:
+        # Get vector store instance (should be fast if already initialized)
+        vector_store_instance = await get_vector_store()
+        
+        logger.info(f"🔍 Querying documents in space {request.space_id}")
+        logger.info(f"Query: {request.query}")
+        logger.info(f"Top K: {request.top_k}")
+        
+        # Single search call - no threshold iterations
+        results = await vector_store_instance.async_search_similar(
+            query_text=request.query,
+            limit=request.top_k,
+            filter_expr=request.filter_expr
+        )
+        
+        if results and len(results) > 0:
+            for hit in results[0]:
+                results.append({"space_id": hit.entity.get("space_id")})
+                
+        logger.info(f"✅ Found {len(results)} results")
+        
+        # Generate AI response efficiently
+        ai_response = None
+        
+        if results and config.GEMINI_KEY:
+            logger.info("Generating AI response with Gemini")
+            
+            # Update query service with current vector store if needed
+            if query_service.vector_store is None:
+                query_service.vector_store = vector_store_instance
+            
+            try:
+                # Use synchronous method wrapped in thread pool
+                def _generate_response():
+                    return query_service.generate_response_new(request.query, results)
+                
+                ai_response = await run_in_threadpool(_generate_response)
+                logger.info(f"✅ AI response generated successfully")
+                
+            except Exception as e:
+                logger.error(f"Failed to generate AI response: {str(e)}")
+                # Quick fallback without processing all results
+                ai_response = f"I found {len(results)} relevant documents but couldn't generate an AI response. Please try again."
+                
+        elif results:
+            # Quick fallback response without AI
+            logger.warning("No Gemini API key - providing document excerpts")
+            ai_response = f"Found {len(results)} relevant documents from your query. "
+            if results:
+                ai_response += f"Most relevant excerpt: {results[0].get('content', '')[:200]}..."
+        else:
+            # No results found
+            ai_response = f"No relevant documents found for your query '{request.query}' in this space."
+        
+        processing_time = (datetime.now() - start_time).total_seconds()
+        logger.info(f"⚡ Query completed in {processing_time:.2f}s")
+        
+        return QueryResponse(
+            query=request.query,
+            results=results,
+            response=ai_response,
+            total_results=len(results),
+            processing_time=processing_time
+        )
+        
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error querying documents: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
+    
+
+@app.post("/api/queryOld", response_model=QueryResponse)
+async def query_documents_old(request: QueryRequestOld):
+    """Query the indexed documents - legacy endpoint"""
     
     start_time = datetime.now()
     
     try:
         # Perform similarity search
-        results = vector_store.similarity_search(
+        results = vector_store_old.similarity_search(
             query=request.query,
             top_k=request.top_k,
             filter_expr=request.filter_expr
@@ -741,7 +754,7 @@ async def query_documents(request: QueryRequest):
     except Exception as e:
         logger.error(f"Error querying documents: {str(e)}")
         raise HTTPException(status_code=500, detail="Query processing failed")
-
+    
 @app.get("/api/documents")
 async def list_documents():
     """List all indexed documents"""
@@ -1032,8 +1045,8 @@ async def get_memory_analytics(memory_id: str, user_id: str):
         logger.error(f"Error getting memory analytics: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Analytics failed: {str(e)}")
 
-if __name__ == "__main__":
     
+if __name__ == "__main__":
     uvicorn.run(
         "app:app",
         host="0.0.0.0",
@@ -1041,50 +1054,3 @@ if __name__ == "__main__":
         reload=True,
         log_level="info"
     )
-    
-    
-def retrieve_file_from_supabase(
-    supabase_url: str,
-    supabase_key: str,
-    bucket_name: str,
-    file_path: str,
-    destination_path: Optional[str] = None
-) -> Tuple[bytes, str]:
-    """
-    Retrieve a file from Supabase Storage.
-    """
-    try:
-        # Initialize Supabase client
-        supabase: Client = create_client(supabase_url, supabase_key)
-
-        # Get file name from path
-        file_name = os.path.basename(file_path)
-
-        # Download file from Supabase Storage
-        response = supabase.storage.from_(bucket_name).download(file_path)
-
-        if response is None:
-            logger.error(f"File not found: {file_path} in bucket {bucket_name}")
-            raise HTTPException(status_code=404, detail=f"File {file_path} not found in bucket {bucket_name}")
-
-        # If destination_path is provided, save the file locally
-        if destination_path:
-            try:
-                os.makedirs(os.path.dirname(destination_path), exist_ok=True)
-                with open(destination_path, 'wb') as f:
-                    f.write(response)
-                logger.info(f"File saved to {destination_path}")
-            except Exception as e:
-                logger.error(f"Failed to save file to {destination_path}: {str(e)}")
-                raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
-
-        logger.info(f"Successfully retrieved file: {file_path} from bucket {bucket_name}")
-        return response, file_name
-
-    except Exception as e:
-        logger.error(f"Error retrieving file from Supabase: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve file: {str(e)}")
-
-
-
-    

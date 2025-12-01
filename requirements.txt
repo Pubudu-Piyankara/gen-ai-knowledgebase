@@ -1,0 +1,50 @@
+# Web Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+jinja2>=3.1.2
+werkzeug>=3.0.0
+
+# HTTP Client
+httpx>=0.26,<0.29
+
+# Data Validation
+pydantic>=2.6.0,<3.0.0
+
+# Document Processing
+python-docx>=1.1.2,<2.0.0
+PyPDF2==3.0.1
+markdown==3.5.1
+beautifulsoup4>=4.12.3,<5.0.0
+python-magic==0.4.27
+docling>=2.0.0
+docling-core>=2.0.0
+
+# Machine Learning / Embeddings
+sentence-transformers>=2.7.0
+torch>=2.0.0
+transformers>=4.30.0
+huggingface-hub>=0.23,<1.0
+
+# Vector Database
+pymilvus>=2.4.0
+
+# Database - Supabase
+gotrue>=2.0.0
+postgrest>=0.10.0
+storage3>=0.5.0
+realtime>=1.0.0
+supabase>=2.0.0
+
+# AI/LLM
+google-generativeai==0.3.1
+
+# OCR Support
+pytesseract==0.3.10
+pdf2image==1.16.3
+Pillow==10.1.0
+
+# Utilities
+python-dotenv>=1.0.0
+aiofiles>=23.0.0
+requests>=2.31.0
