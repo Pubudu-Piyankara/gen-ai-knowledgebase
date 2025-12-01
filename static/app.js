@@ -149,7 +149,7 @@ class RAGInterface {
                 include_metadata: this.includeMetadataCheckbox.checked
             };
 
-            const response = await fetch('/api/query', {
+            const response = await fetch('/api/queryOld', { // Changed from '/api/query' to '/api/queryOld'
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -158,6 +158,8 @@ class RAGInterface {
             });
 
             if (!response.ok) {
+                const errorText = await response.text();
+                console.error('Error response:', errorText);
                 throw new Error(`Query failed: ${response.statusText}`);
             }
 
@@ -173,7 +175,7 @@ class RAGInterface {
             this.queryBtn.innerHTML = '<i class="fas fa-search mr-2"></i>Search';
         }
     }
-
+    
     // Chat Functionality
     async sendChatMessage() {
         const message = this.chatInput.value.trim();
@@ -186,7 +188,7 @@ class RAGInterface {
         const typingId = this.addTypingIndicator();
 
         try {
-            const response = await fetch('/api/query', {
+            const response = await fetch('/api/queryOld', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -198,11 +200,18 @@ class RAGInterface {
                 })
             });
 
+            // Log the response for debugging
+            console.log('Response status:', response.status);
+            
             if (!response.ok) {
-                throw new Error(`Chat failed: ${response.statusText}`);
+                const errorText = await response.text();
+                console.error('Error response:', errorText);
+                throw new Error(`Chat failed: ${response.statusText} - ${errorText}`);
             }
 
             const result = await response.json();
+            console.log('Query result:', result);
+            
             this.removeChatMessage(typingId);
             
             // Display AI response
@@ -212,10 +221,9 @@ class RAGInterface {
         } catch (error) {
             console.error('Chat error:', error);
             this.removeChatMessage(typingId);
-            this.addChatMessage('Sorry, I encountered an error while processing your message.', 'bot');
+            this.addChatMessage(`Sorry, I encountered an error: ${error.message}`, 'bot');
         }
     }
-
     // Document Management
     async loadDocuments() {
         try {
