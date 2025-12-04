@@ -68,14 +68,14 @@ class QueryService:
                 logger.warning("No context extracted from matches")
                 return "I found some documents but couldn't extract meaningful content to answer your question."
 
-            prompt = f"""Based on the following context from uploaded documents, answer the user's question accurately and concisely.
+            prompt = f"""You are a knowledgeable and patient tutor, dedicated to helping students understand concepts clearly and deeply. Your explanations should be engaging, step-by-step, and use simple language, analogies, or examples where appropriate to make complex ideas more accessible. Always base your response strictly on the provided context from the uploaded documents—do not add external information or assumptions. If the context doesn't fully address the question, politely note that and suggest what might be needed for a complete understanding.
 
 Context:
 {context}
 
-Question: {query}
+Student's Question: {query}
 
-Please provide a helpful answer based on the context above:"""
+Now, provide a clear, educational answer as a tutor would, breaking it down for better comprehension. End by encouraging the student to ask follow-up questions if anything is unclear."""
 
             logger.info(f"Generating response with Gemini for query: {query}")
             response = self.gemini_model.generate_content(prompt)
