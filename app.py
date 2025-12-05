@@ -127,12 +127,16 @@ vector_store_old = ZillizVectorStore(
 
 # Pydantic models
 class QueryRequest(BaseModel):
-    query: str = Field(..., description="Search query")
+    user_id: str = Field(..., description="User ID (required for authentication)")
+    session_id: Optional[str] = Field(default=None, description="Session ID to group conversation (auto-generated if not provided)")
+    query: str = Field(..., description="Search query/user message")
     space_id: str = Field(..., description="Space ID to search within")
     top_k: int = Field(default=5, ge=1, le=20, description="Number of results to return")
-    # score_threshold: float = Field(default=0.7, ge=0.0, le=1.0, description="Minimum similarity score")
     filter_expr: Optional[str] = Field(default=None, description="Milvus filter expression")
     include_metadata: bool = Field(default=True, description="Include metadata in results")
+    chat_history: Optional[List[Dict[str, str]]] = Field(default=None, description="Optional chat history (fetched from DB if not provided)")
+    topic: Optional[str] = Field(default=None, description="Optional conversation topic/context")
+
     
 class QueryRequestOld(BaseModel):
     query: str = Field(..., description="Search query")
@@ -160,11 +164,13 @@ class GenerateFlashcardsRequest(BaseModel):
     count: int = Field(default=5, ge=1, le=20, description="Number of flashcards to generate")
 
 class QueryResponse(BaseModel):
+    session_id: str
     query: str
     results: List[Dict[str, Any]]
     response: Optional[str] = None
     total_results: int
     processing_time: float
+    chat_history_included: bool = False
 
 class DocumentInfo(BaseModel):
     document_id: str
@@ -637,83 +643,94 @@ async def debug_space_data(space_id: str):
 
 @app.post("/api/query", response_model=QueryResponse)
 async def query_documents(request: QueryRequest):
-    """Query the indexed documents using async vector store - optimized for speed"""
+    """Query the indexed documents using async vector store - generate answers only"""
     
     start_time = datetime.now()
     
+    # No Supabase - all DB handled in Study-Agent
+    # Session ID is optional; use for logging/context if needed
+    session_id = request.session_id or str(uuid.uuid4())
+    logger.info(f"📝 Session ID: {session_id} (for reference only)")
+    
+    vector_store_instance = await get_vector_store()
+    logger.info(f"🔍 Query from user {request.user_id} in session {session_id}, Space: {request.space_id}, Query: {request.query}")
+    
+    # Use provided chat_history for context (no DB fetch)
+    chat_history = request.chat_history or []
+    chat_history_included = bool(request.chat_history)
+    
+    # Perform vector search with fixed field name
     try:
-        # Get vector store instance (should be fast if already initialized)
-        vector_store_instance = await get_vector_store()
-        
-        logger.info(f"🔍 Querying documents in space {request.space_id}")
-        logger.info(f"Query: {request.query}")
-        logger.info(f"Top K: {request.top_k}")
-        
-        # Single search call - no threshold iterations
         results = await vector_store_instance.async_search_similar(
             query_text=request.query,
             limit=request.top_k,
-            filter_expr=request.filter_expr
+            filter_expr=request.filter_expr or f'space_id == "{request.space_id}"',
+            vector_field="embedding" # Fixed to match schema
         )
-        
-        if results and len(results) > 0:
-            for hit in results[0]:
-                results.append({"space_id": hit.entity.get("space_id")})
-                
-        logger.info(f"✅ Found {len(results)} results")
-        
-        # Generate AI response efficiently
-        ai_response = None
-        
-        if results and config.GEMINI_KEY:
-            logger.info("Generating AI response with Gemini")
-            
-            # Update query service with current vector store if needed
-            if query_service.vector_store is None:
-                query_service.vector_store = vector_store_instance
-            
-            try:
-                # Use synchronous method wrapped in thread pool
-                def _generate_response():
-                    return query_service.generate_response_new(request.query, results)
-                
-                ai_response = await run_in_threadpool(_generate_response)
-                logger.info(f"✅ AI response generated successfully")
-                
-            except Exception as e:
-                logger.error(f"Failed to generate AI response: {str(e)}")
-                # Quick fallback without processing all results
-                ai_response = f"I found {len(results)} relevant documents but couldn't generate an AI response. Please try again."
-                
-        elif results:
-            # Quick fallback response without AI
-            logger.warning("No Gemini API key - providing document excerpts")
-            ai_response = f"Found {len(results)} relevant documents from your query. "
-            if results:
-                ai_response += f"Most relevant excerpt: {results[0].get('content', '')[:200]}..."
-        else:
-            # No results found
-            ai_response = f"No relevant documents found for your query '{request.query}' in this space."
-        
-        processing_time = (datetime.now() - start_time).total_seconds()
-        logger.info(f"⚡ Query completed in {processing_time:.2f}s")
-        
-        return QueryResponse(
-            query=request.query,
-            results=results,
-            response=ai_response,
-            total_results=len(results),
-            processing_time=processing_time
-        )
-        
-        
-    except HTTPException:
-        raise
+        logger.info(f"✅ Found {len(results)} results from vector search")
     except Exception as e:
-        logger.error(f"Error querying documents: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
+        logger.error(f"❌ Search error: {str(e)}")
+        results = []
     
-
+    # Generate AI response with session-relevant context
+    ai_response = None
+    
+    if results and config.GEMINI_KEY:
+        logger.info("🤖 Generating AI response with Gemini")
+        
+        if query_service.vector_store is None:
+            query_service.vector_store = vector_store_instance
+        
+        try:
+            # Build context from provided chat_history (session-specific)
+            context_messages = ""
+            if chat_history:
+                context_messages = "\n\nPrevious conversation (session context):\n"
+                for msg in chat_history[-5:]:  # Last 5 for recency
+                    role = "User" if msg["role"] == "user" else "Assistant"
+                    context_messages += f"{role}: {msg['content']}\n"
+            
+            # Add topic if provided
+            if request.topic:
+                context_messages += f"\nTopic: {request.topic}\n"
+            
+            # Enhance query with session context
+            enhanced_query = request.query
+            if context_messages:
+                enhanced_query = f"{context_messages}\n\nCurrent question: {request.query}"
+            
+            def _generate_response():
+                return query_service.generate_response_new(enhanced_query, results)
+            
+            ai_response = await run_in_threadpool(_generate_response)
+            logger.info("✅ AI response generated with session context")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to generate AI response: {str(e)}")
+            ai_response = f"I found {len(results)} relevant documents but couldn't generate an AI response. Please try again."
+            
+    elif results:
+        logger.warning("⚠️ No Gemini API key - providing document excerpts")
+        ai_response = f"Found {len(results)} relevant documents. "
+        if results:
+            ai_response += f"Most relevant excerpt: {results[0].get('content', '')[:200]}..."
+    else:
+        ai_response = f"No relevant documents found for your query in this space."
+    
+    processing_time = (datetime.now() - start_time).total_seconds()
+    logger.info(f"⚡ Query completed in {processing_time:.2f}s")
+    
+    return QueryResponse(
+        session_id=session_id,
+        query=request.query,
+        results=results,
+        response=ai_response,
+        total_results=len(results),
+        processing_time=processing_time,
+        chat_history_included=chat_history_included
+    )
+    
+    
 @app.post("/api/queryOld", response_model=QueryResponse)
 async def query_documents_old(request: QueryRequestOld):
     """Query the indexed documents - legacy endpoint"""
