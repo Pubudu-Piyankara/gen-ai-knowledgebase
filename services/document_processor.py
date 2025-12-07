@@ -10,7 +10,7 @@ from docling.document_converter import PdfFormatOption
 
 logger = logging.getLogger(__name__)
 
-class DocumentProcessor:
+class BasicDocumentProcessor:
     """Enhanced document processor using DocLing for better parsing"""
     
     def __init__(self):

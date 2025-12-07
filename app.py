@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 import uvicorn
 
-from services.document_processor import DocumentProcessor
+from services.document_processor import BasicDocumentProcessor
 from services.file_service import async_download_file, async_save_temp_file, cleanup_temp_file, save_uploaded_file
 from services.memory_service import async_update_memory_status, update_memory_status
 from services.validation_service import validate_file, validate_request_data,validate_file_size
@@ -114,7 +114,7 @@ app.add_middleware(
 
 # Initialize services
 config = Config()
-document_processor = DocumentProcessor()
+document_processor = BasicDocumentProcessor()
 query_service = QueryService(vector_store=None, GEMINI_KEY=config.GEMINI_KEY)
 storage_manager = StorageManager(config)
 vector_store_old = ZillizVectorStore(

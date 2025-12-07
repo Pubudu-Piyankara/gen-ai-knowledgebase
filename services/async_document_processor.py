@@ -6,23 +6,16 @@ import xml.etree.ElementTree as ET
 from typing import List, Dict, Any
 from datetime import datetime
 
-import io
 from PyPDF2 import PdfReader
+import cv2
+import numpy as np
 from pdf2image import convert_from_path
-from PIL import Image
 import pytesseract
 from config import Config
 
 logger = logging.getLogger(__name__)
 
 # Check for optional dependencies
-try:
-    import PyPDF2
-    PDF_AVAILABLE = True
-except ImportError:
-    PDF_AVAILABLE = False
-    logger.warning("PyPDF2 not available. PDF processing disabled.")
-
 try:
     from docx import Document
     DOCX_AVAILABLE = True
@@ -45,6 +38,15 @@ except ImportError:
     RTF_AVAILABLE = False
     logger.warning("striprtf not available. RTF processing disabled.")
 
+try:
+    import pdf2image
+    import pytesseract
+    from PIL import Image
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+    logger.warning("OCR dependencies (pdf2image, pytesseract, pillow) not available. OCR fallback disabled for image-based PDFs.")
+
 class DocumentProcessor:
     """Document processor for extracting text content from various file formats."""
     
@@ -53,8 +55,7 @@ class DocumentProcessor:
         # Build supported extensions based on available dependencies
         base_extensions = {'.txt', '.md'}  # Always supported
         
-        if PDF_AVAILABLE:
-            base_extensions.add('.pdf')
+        base_extensions.add('.pdf')  # PDF is always "supported" but may fall back if deps missing
         if DOCX_AVAILABLE:
             base_extensions.update({'.docx', '.doc'})
         if RTF_AVAILABLE:
@@ -65,6 +66,8 @@ class DocumentProcessor:
         
         self.supported_extensions = base_extensions
         logger.info(f"DocumentProcessor initialized with support for: {sorted(self.supported_extensions)}")
+        if not OCR_AVAILABLE:
+            logger.warning("OCR not available; image-based PDFs may fail to extract text.")
     
     def process_file(self, file_path: str, original_filename: str = None) -> str:
         """
@@ -85,8 +88,6 @@ class DocumentProcessor:
             logger.info(f"📄 Processing file type: {file_extension} (original: {original_filename})")
             
             if file_extension == '.pdf':
-                if not PDF_AVAILABLE:
-                    raise ValueError("PDF processing not available. Install PyPDF2: pip install PyPDF2")
                 return self._process_pdf(file_path)
             elif file_extension in ['.docx', '.doc']:
                 if not DOCX_AVAILABLE:
@@ -107,15 +108,15 @@ class DocumentProcessor:
                 raise ValueError(f"Unsupported file type: {file_extension}. Supported: {sorted(self.supported_extensions)}")
                 
         except Exception as e:
-            logger.error(f"Error processing file {file_path}: {str(e)}")
+            logger.error(f"Error processing file {file_path}: {str(e)}", exc_info=True)
             raise
     
     def _process_pdf(self, file_path: str) -> str:
-        """Extract text from PDF files."""
+        """Extract text from PDF files with configurable OCR fallback."""
         try:
             text_content = ""
             with open(file_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
+                pdf_reader = PdfReader(file)
                 
                 for page_num, page in enumerate(pdf_reader.pages):
                     try:
@@ -127,16 +128,39 @@ class DocumentProcessor:
                         logger.warning(f"Error extracting page {page_num + 1}: {e}")
                         continue
             
+            # Check if OCR is needed based on configuration threshold
+            min_threshold = getattr(self.config, 'OCR_MIN_TEXT_THRESHOLD', 100)
+            enable_ocr = getattr(self.config, 'ENABLE_OCR', True)
+            
+            if enable_ocr and OCR_AVAILABLE and (not text_content.strip() or len(text_content.strip()) < min_threshold):
+                logger.warning(
+                    f"Minimal text extracted ({len(text_content.strip())} chars, "
+                    f"threshold: {min_threshold}), attempting OCR..."
+                )
+                try:
+                    ocr_text = self._extract_text_with_ocr(file_path)
+                    if ocr_text and len(ocr_text.strip()) > len(text_content.strip()):
+                        logger.info(f"✅ OCR extraction successful: {len(ocr_text)} characters")
+                        text_content = ocr_text
+                    else:
+                        logger.warning("OCR did not improve text extraction, using original")
+                except Exception as ocr_error:
+                    logger.error(f"❌ OCR extraction failed: {str(ocr_error)}")
+                    if not text_content.strip():
+                        return "No text content could be extracted from this PDF file. OCR processing failed."
+            elif enable_ocr and not OCR_AVAILABLE:
+                logger.warning("OCR enabled but dependencies not available; skipping OCR fallback.")
+            
             if not text_content.strip():
-                logger.warning("No text extracted from PDF, file might be image-based")
                 return "No text content could be extracted from this PDF file."
             
             logger.info(f"✅ Extracted {len(text_content)} characters from PDF")
             return self._clean_text(text_content)
             
         except Exception as e:
-            logger.error(f"Error processing PDF: {str(e)}")
+            logger.error(f"Error processing PDF: {str(e)}", exc_info=True)
             raise
+
     
     def _process_docx(self, file_path: str) -> str:
         """Extract text from DOCX files."""
@@ -167,7 +191,7 @@ class DocumentProcessor:
             return self._clean_text(text_content)
             
         except Exception as e:
-            logger.error(f"Error processing DOCX: {str(e)}")
+            logger.error(f"Error processing DOCX: {str(e)}", exc_info=True)
             raise
     
     def _process_txt(self, file_path: str) -> str:
@@ -195,7 +219,7 @@ class DocumentProcessor:
             return self._clean_text(content)
             
         except Exception as e:
-            logger.error(f"Error processing TXT file: {str(e)}")
+            logger.error(f"Error processing TXT file: {str(e)}", exc_info=True)
             raise
     
     def _process_markdown(self, file_path: str) -> str:
@@ -218,7 +242,7 @@ class DocumentProcessor:
             return self._clean_text(text_content)
             
         except Exception as e:
-            logger.error(f"Error processing Markdown: {str(e)}")
+            logger.error(f"Error processing Markdown: {str(e)}", exc_info=True)
             # Fallback: treat as plain text
             return self._process_txt(file_path)
     
@@ -234,7 +258,7 @@ class DocumentProcessor:
             return self._clean_text(text_content)
             
         except Exception as e:
-            logger.error(f"Error processing RTF: {str(e)}")
+            logger.error(f"Error processing RTF: {str(e)}", exc_info=True)
             raise
     
     def _process_odt(self, file_path: str) -> str:
@@ -270,7 +294,7 @@ class DocumentProcessor:
                                 if child.tail:
                                     text_elements.append(child.tail)
                     
-                    text_content = '\n'.join(text_elements)
+                    text_content = '\n'.join([t.strip() for t in text_elements if t and t.strip()])
                     
                 except KeyError:
                     logger.error("content.xml not found in ODT file")
@@ -290,7 +314,7 @@ class DocumentProcessor:
             logger.error("Invalid ODT file - not a valid ZIP archive")
             raise ValueError("Invalid ODT file format")
         except Exception as e:
-            logger.error(f"Error processing ODT: {str(e)}")
+            logger.error(f"Error processing ODT: {str(e)}", exc_info=True)
             raise
     
     def _clean_markdown_syntax(self, text: str) -> str:
@@ -328,26 +352,13 @@ class DocumentProcessor:
         return text
     
     def chunk_content(self, content: str, file_name: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> List[Dict[str, Any]]:
-        """
-        Split content into overlapping chunks for vector storage.
-        
-        Args:
-            content: Text content to chunk
-            file_name: Original filename
-            chunk_size: Maximum size of each chunk
-            chunk_overlap: Number of characters to overlap between chunks
-        
-        Returns:
-            List of chunk dictionaries with content and metadata
-        """
         if not content or not content.strip():
-            logger.warning("No content to chunk")
+            logger.warning(f"No content to chunk for file {file_name}")
             return []
         
         chunks = []
         content = content.strip()
         
-        # If content is smaller than chunk size, return as single chunk
         if len(content) <= chunk_size:
             chunks.append({
                 'content': content,
@@ -359,42 +370,49 @@ class DocumentProcessor:
                     'created_at': datetime.now().isoformat()
                 }
             })
+            logger.info(f"Single chunk created for small content (size: {len(content)})")
             return chunks
         
-        # Split into overlapping chunks
         start = 0
         chunk_index = 0
+        max_iterations = len(content) // (chunk_size - chunk_overlap) + 10  # Increased buffer
+        iteration = 0
         
-        while start < len(content):
-            # Calculate end position
-            end = start + chunk_size
+        while start < len(content) and iteration < max_iterations:
+            iteration += 1
+            end = min(start + chunk_size, len(content))
             
-            # If this isn't the last chunk, try to find a good break point
             if end < len(content):
-                # Look for sentence boundaries within the last 200 characters
-                search_start = max(start + chunk_size - 200, start + chunk_size // 2)
+                search_start = max(start + chunk_size - chunk_overlap, start + chunk_size // 2)
                 
-                # Try to find sentence endings
+                found_break = False
                 for punct in ['. ', '.\n', '! ', '!\n', '? ', '?\n']:
                     punct_pos = content.rfind(punct, search_start, end)
                     if punct_pos != -1:
-                        end = punct_pos + len(punct)
+                        proposed_end = punct_pos + len(punct)
+                        if proposed_end - chunk_overlap > start:  # Ensure advance
+                            end = proposed_end
+                            found_break = True
                         break
-                else:
-                    # If no sentence boundary, try paragraph breaks
+                
+                if not found_break:
                     para_pos = content.rfind('\n\n', search_start, end)
                     if para_pos != -1:
-                        end = para_pos + 2
-                    else:
-                        # If no paragraph break, try word boundaries
-                        space_pos = content.rfind(' ', search_start, end)
-                        if space_pos != -1:
-                            end = space_pos + 1
+                        proposed_end = para_pos + 2
+                        if proposed_end - chunk_overlap > start:
+                            end = proposed_end
+                            found_break = True
+                
+                if not found_break:
+                    space_pos = content.rfind(' ', search_start, end)
+                    if space_pos != -1:
+                        proposed_end = space_pos + 1
+                        if proposed_end - chunk_overlap > start:
+                            end = proposed_end
             
-            # Extract chunk
             chunk_content = content[start:end].strip()
             
-            if chunk_content:  # Only add non-empty chunks
+            if chunk_content:
                 chunks.append({
                     'content': chunk_content,
                     'metadata': {
@@ -408,215 +426,39 @@ class DocumentProcessor:
                 })
                 chunk_index += 1
             
-            # Move start position for next chunk (with overlap)
-            start = end - chunk_overlap
+            if end >= len(content):
+                break  # Exit after adding the last chunk
             
-            # Prevent infinite loops
-            if start >= end:
-                start = end
+            next_start = end - chunk_overlap
+            if next_start <= start:
+                logger.warning(f"Chunking progress stalled at start={start}, end={end}; forcing advance")
+                next_start = start + 1  # Minimal advance to prevent loop
+            start = next_start
         
-        # Update total chunks in metadata
+        if iteration >= max_iterations:
+            logger.error(f"Chunking exceeded max iterations for {file_name}; possible infinite loop prevented")
+        
+        total_chunks = len(chunks)
+        if total_chunks == 0:
+            logger.error(f"No chunks created for {file_name} despite having content (length: {len(content)})")
+        
         for chunk in chunks:
-            chunk['metadata']['total_chunks'] = len(chunks)
+            chunk['metadata']['total_chunks'] = total_chunks
         
-        logger.info(f"✂️ Split content into {len(chunks)} chunks (size: {chunk_size}, overlap: {chunk_overlap})")
+        logger.info(f"✂️ Split content into {total_chunks} chunks (size: {chunk_size}, overlap: {chunk_overlap})")
         return chunks
-    
-    def _extract_text_from_pdf(self, file_path: str) -> str:
-        """Extract text from PDF with OCR fallback"""
-        try:
-            reader = PdfReader(file_path)
-            text = ""
-            
-            # Try normal text extraction first
-            for page in reader.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-            
-            # If minimal text extracted, use OCR
-            if len(text.strip()) < 100:
-                logger.warning("Minimal text extracted, attempting OCR...")
-                text = self._extract_text_with_ocr(file_path)
-            
-            return text.strip()
-            
-        except Exception as e:
-            logger.error(f"Error extracting text from PDF: {str(e)}")
-            # Fallback to OCR if normal extraction fails
-            try:
-                return self._extract_text_with_ocr(file_path)
-            except Exception as ocr_error:
-                logger.error(f"OCR extraction also failed: {str(ocr_error)}")
-                raise
-    
-    def _extract_text_with_ocr(self, file_path: str) -> str:
-        """Extract text from image-based PDF using OCR"""
-        try:
-            logger.info("🔍 Starting OCR extraction...")
-            
-            # Convert PDF to images
-            images = convert_from_path(file_path, dpi=300)
-            logger.info(f"📄 Converted PDF to {len(images)} images")
-            
-            text = ""
-            for i, image in enumerate(images):
-                logger.info(f"🔎 Processing page {i+1}/{len(images)} with OCR...")
-                
-                # Extract text using Tesseract
-                page_text = pytesseract.image_to_string(image, lang='eng')
-                text += page_text + "\n\n"
-                
-                logger.info(f"✅ Page {i+1}: Extracted {len(page_text)} characters")
-            
-            logger.info(f"✅ OCR completed: Total {len(text)} characters extracted")
-            return text.strip()
-            
-        except Exception as e:
-            logger.error(f"❌ OCR extraction failed: {str(e)}")
-            raise
-        
-    def _process_pdf(self, file_path: str) -> str:
-        """Extract text from PDF files with OCR fallback."""
-        try:
-            text_content = ""
-            with open(file_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                
-                for page_num, page in enumerate(pdf_reader.pages):
-                    try:
-                        page_text = page.extract_text()
-                        if page_text:
-                            text_content += f"\n--- Page {page_num + 1} ---\n"
-                            text_content += page_text
-                    except Exception as e:
-                        logger.warning(f"Error extracting page {page_num + 1}: {e}")
-                        continue
-            
-            # Check if we got meaningful text (more than just whitespace/metadata)
-            if not text_content.strip() or len(text_content.strip()) < 100:
-                logger.warning(f"Minimal text extracted ({len(text_content.strip())} chars), attempting OCR...")
-                try:
-                    text_content = self._extract_text_with_ocr(file_path)
-                    logger.info(f"✅ OCR extraction successful: {len(text_content)} characters")
-                except Exception as ocr_error:
-                    logger.error(f"❌ OCR extraction failed: {str(ocr_error)}")
-                    # Return what we have rather than failing completely
-                    if text_content.strip():
-                        logger.warning("Using minimal extracted text as fallback")
-                    else:
-                        return "No text content could be extracted from this PDF file. The file may be corrupted or encrypted."
-            
-            logger.info(f"✅ Extracted {len(text_content)} characters from PDF")
-            return self._clean_text(text_content)
-            
-        except Exception as e:
-            logger.error(f"Error processing PDF: {str(e)}")
-            raise
 
     def _extract_text_with_ocr(self, file_path: str) -> str:
-        """Extract text from image-based PDF using OCR"""
-        try:
-            logger.info("🔍 Starting OCR extraction...")
-            
-            # Convert PDF to images with higher DPI for better OCR accuracy
-            images = convert_from_path(file_path, dpi=300)
-            logger.info(f"📄 Converted PDF to {len(images)} images")
-            
-            text = ""
-            for i, image in enumerate(images):
-                logger.info(f"🔎 Processing page {i+1}/{len(images)} with OCR...")
-                
-                # Extract text using Tesseract with English language
-                # You can add more languages if needed: lang='eng+spa'
-                page_text = pytesseract.image_to_string(image, lang='eng')
-                
-                if page_text.strip():
-                    text += f"\n--- Page {i+1} (OCR) ---\n"
-                    text += page_text + "\n\n"
-                    logger.info(f"✅ Page {i+1}: Extracted {len(page_text)} characters")
-                else:
-                    logger.warning(f"⚠️ Page {i+1}: No text extracted")
-            
-            if not text.strip():
-                logger.warning("❌ OCR completed but no text was extracted")
-                return "OCR processing completed but no readable text was found in the PDF."
-            
-            logger.info(f"✅ OCR completed: Total {len(text)} characters extracted from {len(images)} pages")
-            return text.strip()
-            
-        except ImportError as e:
-            logger.error(f"❌ OCR dependencies not installed: {str(e)}")
-            raise ValueError(
-                "OCR processing requires additional packages. "
-                "Install with: pip install pdf2image pytesseract pillow\n"
-                "Also ensure Tesseract OCR is installed on your system:\n"
-                "- macOS: brew install tesseract\n"
-                "- Ubuntu: sudo apt-get install tesseract-ocr\n"
-                "- Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki"
-            )
-        except Exception as e:
-            logger.error(f"❌ OCR extraction failed: {str(e)}")
-            raise
+        """Extract text from image-based PDF using OCR with configuration and preprocessing."""
+        if not OCR_AVAILABLE:
+            raise ValueError("OCR dependencies not installed. Cannot perform OCR.")
         
-    def _process_pdf(self, file_path: str) -> str:
-        """Extract text from PDF files with configurable OCR fallback."""
-        try:
-            text_content = ""
-            with open(file_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                
-                for page_num, page in enumerate(pdf_reader.pages):
-                    try:
-                        page_text = page.extract_text()
-                        if page_text:
-                            text_content += f"\n--- Page {page_num + 1} ---\n"
-                            text_content += page_text
-                    except Exception as e:
-                        logger.warning(f"Error extracting page {page_num + 1}: {e}")
-                        continue
-            
-            # Check if OCR is needed based on configuration threshold
-            min_threshold = getattr(self.config, 'OCR_MIN_TEXT_THRESHOLD', 100)
-            enable_ocr = getattr(self.config, 'ENABLE_OCR', True)
-            
-            if enable_ocr and (not text_content.strip() or len(text_content.strip()) < min_threshold):
-                logger.warning(
-                    f"Minimal text extracted ({len(text_content.strip())} chars, "
-                    f"threshold: {min_threshold}), attempting OCR..."
-                )
-                try:
-                    ocr_text = self._extract_text_with_ocr(file_path)
-                    if ocr_text and len(ocr_text.strip()) > len(text_content.strip()):
-                        logger.info(f"✅ OCR extraction successful: {len(ocr_text)} characters")
-                        text_content = ocr_text
-                    else:
-                        logger.warning("OCR did not improve text extraction, using original")
-                except Exception as ocr_error:
-                    logger.error(f"❌ OCR extraction failed: {str(ocr_error)}")
-                    if not text_content.strip():
-                        return "No text content could be extracted from this PDF file. OCR processing failed."
-            
-            if not text_content.strip():
-                return "No text content could be extracted from this PDF file."
-            
-            logger.info(f"✅ Extracted {len(text_content)} characters from PDF")
-            return self._clean_text(text_content)
-            
-        except Exception as e:
-            logger.error(f"Error processing PDF: {str(e)}")
-            raise
-    
-    def _extract_text_with_ocr(self, file_path: str) -> str:
-        """Extract text from image-based PDF using OCR with configuration."""
         try:
             logger.info("🔍 Starting OCR extraction...")
             
-            # Get DPI from config
             dpi = getattr(self.config, 'OCR_DPI', 300)
             languages = getattr(self.config, 'OCR_LANGUAGES', 'eng')
             
-            # Convert PDF to images
             logger.info(f"📄 Converting PDF to images (DPI: {dpi})...")
             images = convert_from_path(file_path, dpi=dpi)
             logger.info(f"📄 Converted PDF to {len(images)} images")
@@ -628,8 +470,24 @@ class DocumentProcessor:
                 logger.info(f"🔎 Processing page {i+1}/{len(images)} with OCR (lang: {languages})...")
                 
                 try:
-                    # Extract text using Tesseract
-                    page_text = pytesseract.image_to_string(image, lang=languages)
+                    img_array = np.array(image)
+                    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+                    
+                    # Otsu's binarization for adaptive thresholding
+                    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    
+                    # Noise removal
+                    denoised = cv2.medianBlur(thresh, 3)
+                    
+                    # Dilation to thicken handwriting lines
+                    kernel = np.ones((2,2), np.uint8)  # Adjust kernel for thickness
+                    dilated = cv2.dilate(denoised, kernel, iterations=1)
+                    
+                    processed_image = Image.fromarray(dilated)
+                    
+                    # Use PSM 3 for fully automatic layout
+                    config = '--psm 3 --oem 1'
+                    page_text = pytesseract.image_to_string(processed_image, lang=languages, config=config)
                     
                     if page_text.strip():
                         text += f"\n--- Page {i+1} (OCR) ---\n"
@@ -646,22 +504,10 @@ class DocumentProcessor:
                 logger.warning("❌ OCR completed but no text was extracted from any page")
                 return "OCR processing completed but no readable text was found in the PDF."
             
-            logger.info(
-                f"✅ OCR completed: Total {len(text)} characters extracted "
-                f"from {successful_pages}/{len(images)} pages"
-            )
+            logger.info(f"✅ OCR completed: Total {len(text)} characters extracted from {successful_pages}/{len(images)} pages")
             return text.strip()
             
-        except ImportError as e:
-            logger.error(f"❌ OCR dependencies not installed: {str(e)}")
-            raise ValueError(
-                "OCR processing requires additional packages:\n"
-                "  pip install pdf2image pytesseract pillow PyPDF2\n\n"
-                "System dependencies:\n"
-                "  macOS: brew install tesseract poppler\n"
-                "  Ubuntu: sudo apt-get install tesseract-ocr poppler-utils\n"
-                "  Windows: See https://github.com/UB-Mannheim/tesseract/wiki"
-            )
         except Exception as e:
-            logger.error(f"❌ OCR extraction failed: {str(e)}")
+            logger.error(f"❌ OCR extraction failed: {str(e)}", exc_info=True)
             raise
+
