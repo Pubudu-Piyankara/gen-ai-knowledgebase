@@ -1,4 +1,5 @@
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -94,7 +95,11 @@ async def process_document_background(
     
     finally:
         # Always cleanup the temporary file
-        if temp_path and (temp_path.startswith('/tmp') or temp_path.startswith('/var/folders')):
-            await async_cleanup_temp_file(temp_path)
-        else:
-            logger.warning(f"Suspicious temp path, not cleaning up: {temp_path}")
+        if temp_path:
+            # Resolve the real path to prevent path traversal attacks
+            real_path = os.path.realpath(temp_path)
+            # Verify the resolved path is within allowed temp directories
+            if real_path.startswith('/tmp') or real_path.startswith('/var/folders'):
+                await async_cleanup_temp_file(temp_path)
+            else:
+                logger.warning(f"Suspicious temp path, not cleaning up: {temp_path} (resolved: {real_path})")
