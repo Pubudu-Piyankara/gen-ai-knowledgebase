@@ -99,7 +99,10 @@ async def process_document_background(
             # Resolve the real path to prevent path traversal attacks
             real_path = os.path.realpath(temp_path)
             # Verify the resolved path is within allowed temp directories
-            if real_path.startswith('/tmp') or real_path.startswith('/var/folders'):
-                await async_cleanup_temp_file(temp_path)
+            allowed_dirs = ['/tmp/', '/var/folders/']
+            is_valid = any(real_path.startswith(d) or real_path == d.rstrip('/') for d in allowed_dirs)
+            
+            if is_valid:
+                await async_cleanup_temp_file(real_path)
             else:
                 logger.warning(f"Suspicious temp path, not cleaning up: {temp_path} (resolved: {real_path})")
