@@ -10,6 +10,7 @@ from pymilvus import connections, Collection, FieldSchema, CollectionSchema, Dat
 from config import Config
 
 logger = logging.getLogger(__name__)
+config = Config()
 
 class ZillizVectorStoreNew:
     """Async vector store implementation using Zilliz Cloud (managed Milvus)."""
@@ -513,22 +514,24 @@ class ZillizVectorStoreNew:
         self,
         query_text: str,
         limit: int = 10,
-        filter_expr: Optional[str] = None
+        filter_expr: Optional[str] = None,
+        vector_field: str = "embedding",  # 1. Added this parameter
+        **kwargs                       # 2. Added kwargs to catch any other unexpected arguments safely
     ) -> List[Dict[str, Any]]:
-        """Search for similar documents asynchronously - optimized version based on working sync method"""
+        """Search for similar documents asynchronously."""
         try:
             await self._ensure_initialized()
             
             # Generate query embedding
             query_embeddings = await self.async_generate_embeddings([query_text])
-            query_embedding = query_embeddings[0]  # Get the first (and only) embedding
+            query_embedding = query_embeddings[0] 
             
             def _search():
                 try:
                     # Ensure collection is loaded for search
                     self.collection.load()
                     
-                    # Search parameters for AUTOINDEX (same as working version)
+                    # Search parameters for AUTOINDEX
                     search_params = {
                         "metric_type": "COSINE",
                         "params": {"nprobe": 10}
@@ -536,19 +539,19 @@ class ZillizVectorStoreNew:
                     
                     logger.info(f"🔍 Searching with query embedding dimension: {len(query_embedding)}")
                     
-                    # Perform search using the same field names as working version
+                    # Perform search using the passed vector_field
                     results = self.collection.search(
-                        data=[query_embedding],  # Use the embedding directly as list
-                        anns_field="vector",     # Use "vector" instead of "embedding" 
+                        data=[query_embedding], 
+                        anns_field=vector_field,     # 3. Use the variable here instead of hardcoded "vector"
                         param=search_params,
                         limit=limit,
-                        output_fields=["content", "file_name", "chunk_index", "total_chunks", "memory_id", "file_url", "space_id"],  # Match your actual schema
+                        output_fields=["content", "file_name", "chunk_index", "total_chunks", "memory_id", "file_url", "space_id"], 
                         expr=filter_expr
                     )
                     
                     logger.info(f"🔍 Search returned {len(results[0]) if results and len(results) > 0 else 0} results")
                     
-                    # Process results efficiently (same format as working version)
+                    # Process results efficiently
                     similar_docs = []
                     if results and len(results) > 0:
                         for hit in results[0]:
@@ -569,8 +572,6 @@ class ZillizVectorStoreNew:
                     
                 except Exception as e:
                     logger.error(f"❌ Search error: {str(e)}")
-                    logger.error(f"Query embedding type: {type(query_embedding)}")
-                    logger.error(f"Query embedding length: {len(query_embedding) if hasattr(query_embedding, '__len__') else 'No length'}")
                     return []
             
             results = await run_in_threadpool(_search)
@@ -581,7 +582,8 @@ class ZillizVectorStoreNew:
         except Exception as e:
             logger.error(f"❌ Error in async search: {str(e)}")
             return []
-
+        
+        
     async def async_delete_memory_documents(self, memory_id: str) -> bool:
         """Delete all documents associated with a memory ID."""
         try:
