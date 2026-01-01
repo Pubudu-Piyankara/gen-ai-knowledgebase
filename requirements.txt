@@ -26,8 +26,10 @@ torch>=2.0.0
 transformers>=4.30.0
 huggingface-hub>=0.23,<1.0
 
-# Vector Database
-pymilvus>=2.4.0
+# Vector Database - Pin to working versions
+pymilvus==2.3.7
+environs==9.5.0
+marshmallow==3.20.2
 
 # Database - Supabase
 gotrue>=2.0.0
@@ -39,10 +41,11 @@ supabase>=2.0.0
 # AI/LLM
 google-generativeai==0.3.1
 
-# OCR Support
+# OCR and Image Processing
 pytesseract==0.3.10
 pdf2image==1.16.3
 Pillow==10.1.0
+opencv-python-headless==4.8.1.78
 
 # Utilities
 python-dotenv>=1.0.0

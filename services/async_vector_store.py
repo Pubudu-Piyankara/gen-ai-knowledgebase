@@ -510,13 +510,87 @@ class ZillizVectorStoreNew:
             return False
     
 
+    # async def async_search_similar(
+    #     self,
+    #     query_text: str,
+    #     limit: int = 10,
+    #     filter_expr: Optional[str] = None,
+    #     vector_field: str = "embedding",  # 1. Added this parameter
+    #     **kwargs                       # 2. Added kwargs to catch any other unexpected arguments safely
+    # ) -> List[Dict[str, Any]]:
+    #     """Search for similar documents asynchronously."""
+    #     try:
+    #         await self._ensure_initialized()
+            
+    #         # Generate query embedding
+    #         query_embeddings = await self.async_generate_embeddings([query_text])
+    #         query_embedding = query_embeddings[0] 
+            
+    #         def _search():
+    #             try:
+    #                 # Ensure collection is loaded for search
+    #                 self.collection.load()
+                    
+    #                 # Search parameters for AUTOINDEX
+    #                 search_params = {
+    #                     "metric_type": "COSINE",
+    #                     "params": {"nprobe": 10}
+    #                 }
+                    
+    #                 logger.info(f"🔍 Searching with query embedding dimension: {len(query_embedding)}")
+                    
+    #                 # Perform search using the passed vector_field
+    #                 results = self.collection.search(
+    #                     data=[query_embedding], 
+    #                     anns_field=vector_field,     # 3. Use the variable here instead of hardcoded "vector"
+    #                     param=search_params,
+    #                     limit=limit,
+    #                     output_fields=["content", "file_name", "chunk_index", "total_chunks", "memory_id", "file_url", "space_id"], 
+    #                     expr=filter_expr
+    #                 )
+                    
+    #                 logger.info(f"🔍 Search returned {len(results[0]) if results and len(results) > 0 else 0} results")
+                    
+    #                 # Process results efficiently
+    #                 similar_docs = []
+    #                 if results and len(results) > 0:
+    #                     for hit in results[0]:
+    #                         similar_docs.append({
+    #                             "id": hit.id,
+    #                             "content": hit.entity.get("content"),
+    #                             "file_name": hit.entity.get("file_name"),
+    #                             "chunk_index": hit.entity.get("chunk_index"),
+    #                             "total_chunks": hit.entity.get("total_chunks"),
+    #                             "memory_id": hit.entity.get("memory_id"),
+    #                             "file_url": hit.entity.get("file_url"),
+    #                             "space_id": hit.entity.get("space_id"),
+    #                             "similarity_score": float(hit.score)
+    #                         })
+                    
+    #                 logger.info(f"🎯 Processed {len(similar_docs)} results")
+    #                 return similar_docs
+                    
+    #             except Exception as e:
+    #                 logger.error(f"❌ Search error: {str(e)}")
+    #                 return []
+            
+    #         results = await run_in_threadpool(_search)
+    #         logger.info(f"✅ Search completed: {len(results)} results")
+            
+    #         return results
+            
+    #     except Exception as e:
+    #         logger.error(f"❌ Error in async search: {str(e)}")
+    #         return []
+        
+        
     async def async_search_similar(
         self,
         query_text: str,
         limit: int = 10,
         filter_expr: Optional[str] = None,
-        vector_field: str = "embedding",  # 1. Added this parameter
-        **kwargs                       # 2. Added kwargs to catch any other unexpected arguments safely
+        vector_field: str = "embedding",  # Default to correct field name
+        **kwargs
     ) -> List[Dict[str, Any]]:
         """Search for similar documents asynchronously."""
         try:
@@ -524,7 +598,7 @@ class ZillizVectorStoreNew:
             
             # Generate query embedding
             query_embeddings = await self.async_generate_embeddings([query_text])
-            query_embedding = query_embeddings[0] 
+            query_embedding = query_embeddings[0]
             
             def _search():
                 try:
@@ -538,11 +612,12 @@ class ZillizVectorStoreNew:
                     }
                     
                     logger.info(f"🔍 Searching with query embedding dimension: {len(query_embedding)}")
+                    logger.info(f"🔍 Using vector field: {vector_field}")  # Add this log
                     
                     # Perform search using the passed vector_field
                     results = self.collection.search(
                         data=[query_embedding], 
-                        anns_field=vector_field,     # 3. Use the variable here instead of hardcoded "vector"
+                        anns_field=vector_field,
                         param=search_params,
                         limit=limit,
                         output_fields=["content", "file_name", "chunk_index", "total_chunks", "memory_id", "file_url", "space_id"], 
@@ -582,7 +657,6 @@ class ZillizVectorStoreNew:
         except Exception as e:
             logger.error(f"❌ Error in async search: {str(e)}")
             return []
-        
         
     async def async_delete_memory_documents(self, memory_id: str) -> bool:
         """Delete all documents associated with a memory ID."""

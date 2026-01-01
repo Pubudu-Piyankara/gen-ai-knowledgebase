@@ -7,20 +7,41 @@ services:
     ports:
       - "8000:8000"
     environment:
+      # Supabase Configuration
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_KEY=${SUPABASE_KEY}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
       - SUPABASE_BUCKET_NAME=${SUPABASE_BUCKET_NAME}
+      
+      # Milvus/Zilliz Configuration
       - MILVUS_HOST=${MILVUS_HOST:-localhost}
       - MILVUS_PORT=${MILVUS_PORT:-19530}
       - MILVUS_URI=${MILVUS_URI}
       - MILVUS_TOKEN=${MILVUS_TOKEN}
+      - COLLECTION_NAME=${COLLECTION_NAME}
+      
+      # Zilliz Cloud Specific (required for async_vector_store.py)
+      - ZILLIZ_CLOUD_ENDPOINT=${ZILLIZ_CLOUD_ENDPOINT}
+      - ZILLIZ_CLOUD_API_KEY=${ZILLIZ_CLOUD_API_KEY}
+      - ZILLIZ_CLOUD_USERNAME=${ZILLIZ_CLOUD_USERNAME}
+      - ZILLIZ_CLOUD_PASSWORD=${ZILLIZ_CLOUD_PASSWORD}
+      - ZILLIZ_CLOUD_DB_NAME=${ZILLIZ_CLOUD_DB_NAME:-default}
+      - ZILLIZ_CLOUD_PORT=${ZILLIZ_CLOUD_PORT:-443}
+      
+      # AI/LLM Configuration
       - GEMINI_KEY=${GEMINI_KEY}
+      
+      # Application Settings
       - MAX_CONTENT_LENGTH=${MAX_CONTENT_LENGTH:-104857600}
       - CHUNK_SIZE=${CHUNK_SIZE:-1000}
       - CHUNK_OVERLAP=${CHUNK_OVERLAP:-200}
+      
+      # OCR Settings
       - ENABLE_OCR=${ENABLE_OCR:-true}
       - OCR_DPI=${OCR_DPI:-300}
+      - OCR_LANGUAGES=${OCR_LANGUAGES:-eng}
+      - TESSDATA_PREFIX=/usr/share/tesseract-ocr/4.00/tessdata
+      
     volumes:
       - ./uploads:/app/uploads
       - ./logs:/app/logs
